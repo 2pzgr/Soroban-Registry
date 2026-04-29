@@ -22,13 +22,14 @@ import {
   extractErrorData,
   createApiError,
 } from "./errors";
-import { resilientCall } from './resilience';
-import type { 
-  Network, 
-  NetworkStatus, 
-  NetworkEndpoints, 
-  NetworkInfo, 
-  NetworkListResponse, 
+import { resilientCall } from "./resilience";
+import { fetchRecentContracts, fetchContractActivity } from "./stellar";
+import type {
+  Network,
+  NetworkStatus,
+  NetworkEndpoints,
+  NetworkInfo,
+  NetworkListResponse,
   NetworkConfig,
   Contract,
   ContractGetResponse,
@@ -85,10 +86,9 @@ import type {
   GenerateReleaseNotesRequest,
   UpdateReleaseNotesRequest,
   PublishReleaseNotesRequest,
-  DeprecationInfo
+  DeprecationInfo,
 } from "../types";
 import type { VerificationLevel } from "../types/verification";
-
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 const USE_MOCKS = process.env.NEXT_PUBLIC_USE_MOCKS === "true";
@@ -267,11 +267,14 @@ async function handleApiCall<T>(
   apiCall: () => Promise<Response>,
   endpoint: string,
 ): Promise<T> {
-  // Wrap the API call with a circuit breaker + retries
   try {
-    const rawResponse = await resilientCall(endpoint, async () => {
-      return apiCall();
-    }, { endpoint });
+    const rawResponse = await resilientCall(
+      endpoint,
+      async () => {
+        return apiCall();
+      },
+      { endpoint },
+    );
 
     const response = rawResponse as Response;
 
@@ -291,19 +294,17 @@ async function handleApiCall<T>(
       );
     }
   } catch (error) {
-    // Re-throw if already an ApiError
     if (error instanceof ApiError) {
       throw error;
     }
-
-    // Circuit open
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore
-    if (error && error.name === 'CircuitOpenError') {
-      throw new NetworkError('Service temporarily unavailable (circuit open)', endpoint);
+    if (error && error.name === "CircuitOpenError") {
+      throw new NetworkError(
+        "Service temporarily unavailable (circuit open)",
+        endpoint,
+      );
     }
-
-    // Handle network errors
     if (error instanceof TypeError) {
       const message = error.message.toLowerCase();
       if (
@@ -317,16 +318,12 @@ async function handleApiCall<T>(
         );
       }
     }
-
-    // Handle timeout errors
     if (error instanceof Error && error.name === "AbortError") {
       throw new NetworkError(
         "The request timed out. Please try again.",
         endpoint,
       );
     }
-
-    // Unknown error
     throw new ApiError(
       "An unexpected error occurred",
       undefined,
@@ -394,17 +391,15 @@ export const api = {
         "/networks",
       );
       try {
-        // cache for fallback
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('soroban_cached_networks', JSON.stringify(resp));
+        if (typeof window !== "undefined") {
+          localStorage.setItem("soroban_cached_networks", JSON.stringify(resp));
         }
       } catch {}
       return resp;
     } catch (err) {
-      // On network/circuit failures, fall back to cached networks if available
       try {
-        if (typeof window !== 'undefined') {
-          const cached = localStorage.getItem('soroban_cached_networks');
+        if (typeof window !== "undefined") {
+          const cached = localStorage.getItem("soroban_cached_networks");
           if (cached) return JSON.parse(cached) as NetworkListResponse;
         }
       } catch {}
@@ -412,7 +407,8 @@ export const api = {
     }
   },
 
-  // Contract endpoints
+  // ── Contract endpoints ──────────────────────────────────────────────────────
+
   async getContracts(
     params?: ContractSearchParams,
   ): Promise<PaginatedResponse<Contract>> {
@@ -479,7 +475,9 @@ export const api = {
           }
 
           if (params?.favorites_only && params.favorites_list) {
-            filtered = filtered.filter((c) => params.favorites_list!.includes(c.id));
+            filtered = filtered.filter((c) =>
+              params.favorites_list!.includes(c.id),
+            );
           }
 
           if (params?.date_from) {
@@ -549,26 +547,34 @@ export const api = {
 
     const queryParams = new URLSearchParams();
     if (params?.query) queryParams.append("query", params.query);
-    if (params?.contract_id) queryParams.append("contract_id", params.contract_id);
+    if (params?.contract_id)
+      queryParams.append("contract_id", params.contract_id);
     if (params?.network) queryParams.append("network", params.network);
-    params?.networks?.forEach((network) => queryParams.append("networks", network));
+    params?.networks?.forEach((network) =>
+      queryParams.append("networks", network),
+    );
     if (params?.verified_only !== undefined)
       queryParams.append("verified_only", String(params.verified_only));
     if (params?.category) queryParams.append("category", params.category);
-    params?.categories?.forEach((category) => queryParams.append("categories", category));
+    params?.categories?.forEach((category) =>
+      queryParams.append("categories", category),
+    );
 
+    // ── Try the backend first; fall back to Stellar Expert ──────────────────
     try {
       const resp = await handleApiCall<PaginatedResponse<Contract>>(
         () => fetch(`${API_URL}/api/contracts?${queryParams}`),
         "/api/contracts",
       );
-
-      // Normalize legacy field names from older backend responses
       const raw = resp as unknown as Record<string, unknown>;
-      const normalized = { ...resp } as PaginatedResponse<Contract> & Record<string, unknown>;
+      const normalized = { ...resp } as PaginatedResponse<Contract> &
+        Record<string, unknown>;
       try {
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('soroban_cached_contracts', JSON.stringify(normalized));
+        if (typeof window !== "undefined") {
+          localStorage.setItem(
+            "soroban_cached_contracts",
+            JSON.stringify(normalized),
+          );
         }
       } catch {}
       if (Array.isArray(raw.contracts) && !Array.isArray(raw.items)) {
@@ -578,15 +584,29 @@ export const api = {
         normalized.total_pages = raw.pages as number;
       }
       return normalized;
-    } catch (err) {
-      // On failure, attempt to return cached contracts list if available
+    } catch {
+      // Backend unreachable → fetch live data from Stellar Expert
+      const network = params?.network ?? params?.networks?.[0] ?? "mainnet";
+      const limit = params?.page_size ?? 20;
       try {
-        if (typeof window !== 'undefined') {
-          const cached = localStorage.getItem('soroban_cached_contracts');
-          if (cached) return JSON.parse(cached) as PaginatedResponse<Contract>;
-        }
-      } catch {}
-      throw err;
+        const items = await fetchRecentContracts(network, limit);
+        return {
+          items,
+          total: items.length,
+          page: params?.page ?? 1,
+          page_size: limit,
+          total_pages: 1,
+        };
+      } catch {
+        // Last-resort: cached contracts
+        try {
+          if (typeof window !== "undefined") {
+            const cached = localStorage.getItem("soroban_cached_contracts");
+            if (cached) return JSON.parse(cached) as PaginatedResponse<Contract>;
+          }
+        } catch {}
+        return { items: [], total: 0, page: 1, page_size: limit, total_pages: 0 };
+      }
     }
   },
 
@@ -863,11 +883,12 @@ export const api = {
     return response.json();
   },
 
+  // ── Activity Feed ──────────────────────────────────────────────────────────
+
   async getActivityFeed(
     params?: ActivityFeedParams,
   ): Promise<ActivityFeedResponse> {
     if (USE_MOCKS) {
-      // Basic mock for activity feed
       const items: AnalyticsEvent[] = [
         {
           id: "1",
@@ -903,10 +924,33 @@ export const api = {
     if (params?.contract_id) search.set("contract_id", params.contract_id);
 
     const qs = search.toString();
-    return handleApiCall<ActivityFeedResponse>(
-      () => fetch(`${API_URL}/api/activity-feed${qs ? `?${qs}` : ""}`),
-      "/api/activity-feed",
-    );
+
+    // ── Try backend; fall back to live Stellar Expert operations ─────────────
+    try {
+      return await handleApiCall<ActivityFeedResponse>(
+        () => fetch(`${API_URL}/api/activity-feed${qs ? `?${qs}` : ""}`),
+        "/api/activity-feed",
+      );
+    } catch {
+      // Backend offline → pull live on-chain operations from Stellar Expert
+      const network = (params as any)?.network ?? "mainnet";
+      const limit = params?.limit ?? 20;
+      try {
+        const items = await fetchContractActivity(network, limit);
+        // Apply event_type filter if provided
+        const filtered = params?.event_type
+          ? items.filter((e) => e.event_type === params.event_type)
+          : items;
+        return {
+          items: filtered,
+          total: filtered.length,
+          limit,
+          next_cursor: null,
+        };
+      } catch {
+        return { items: [], total: 0, limit: limit, next_cursor: null };
+      }
+    }
   },
 
   async getContractRecommendations(
@@ -1110,7 +1154,8 @@ export const api = {
     return response.json();
   },
 
-  // Publisher endpoints
+  // ── Publisher endpoints ─────────────────────────────────────────────────────
+
   async getPublisher(id: string): Promise<Publisher> {
     if (USE_MOCKS) {
       return Promise.resolve({
@@ -1160,7 +1205,6 @@ export const api = {
     }>(() => fetch(`${API_URL}/api/stats`), "/api/stats");
   },
 
-  // Version upgrade compatibility endpoint
   async getCompatibility(id: string): Promise<CompatibilityMatrix> {
     return handleApiCall<CompatibilityMatrix>(
       () => fetch(`${API_URL}/api/contracts/${id}/compatibility`),
@@ -1196,7 +1240,6 @@ export const api = {
     return `${API_URL}/api/contracts/${id}/compatibility/export?format=${format}`;
   },
 
-  // Graph endpoint (backend may return { graph: {} } or { nodes, edges }; normalize to GraphResponse)
   async getContractGraph(network?: string): Promise<GraphResponse> {
     const queryParams = new URLSearchParams();
     if (network) queryParams.append("network", network);
@@ -1217,7 +1260,6 @@ export const api = {
     );
   },
 
-  // SDK / Wasm / Network Compatibility Testing (Issue #261)
   async getCompatibilityMatrix(
     id: string,
   ): Promise<CompatibilityTestMatrixResponse> {
@@ -1292,8 +1334,6 @@ export const api = {
     );
   },
 
-  // ── Release Notes Generation ────────────────────────────────────────────
-
   async listReleaseNotes(id: string): Promise<ReleaseNotesResponse[]> {
     return handleApiCall<ReleaseNotesResponse[]>(
       () => fetch(`${API_URL}/api/contracts/${id}/release-notes`),
@@ -1361,7 +1401,6 @@ export const api = {
     );
   },
 
-  // Database Migration Versioning (Issue #252)
   async getMigrationStatus(): Promise<MigrationStatusResponse> {
     return handleApiCall<MigrationStatusResponse>(
       () => fetch(`${API_URL}/api/admin/migrations/status`),
@@ -1414,7 +1453,6 @@ export const api = {
     );
   },
 
-  // Advanced Search (Issue #51)
   async advancedSearchContracts(
     req: AdvancedSearchRequest,
   ): Promise<PaginatedResponse<Contract>> {
@@ -1460,8 +1498,6 @@ export const api = {
       );
     }
   },
-
-  // ── Contract Comments / Discussion (Issue #516) ───────────────────────────
 
   async getComments(contractId: string): Promise<CommentListResponse> {
     if (USE_MOCKS || typeof window !== "undefined") {
@@ -1559,8 +1595,6 @@ export const api = {
     );
   },
 
-  // ── Favorites preferences (authenticated) ──────────────────────────────
-
   async getPreferences(token: string): Promise<UserFavoritesPreferences> {
     return handleApiCall<UserFavoritesPreferences>(
       () =>
@@ -1598,7 +1632,6 @@ export interface Template {
   category: string;
   version: string;
   install_count: number;
-  // Image fields for template icon/thumbnail
   thumbnail_url?: string;
   parameters: {
     name: string;
@@ -1657,7 +1690,6 @@ export interface ExampleRating {
 }
 
 export type ProtocolComplianceStatus = "compliant" | "partial" | "unsupported";
-
 export type InteroperabilityCapabilityKind = "bridge" | "adapter";
 
 export interface InteroperabilityProtocolMatch {
@@ -1718,8 +1750,6 @@ export interface ContractInteroperabilityResponse {
   summary: InteroperabilitySummary;
 }
 
-// ─── Compatibility Matrix ────────────────────────────────────────────────────
-
 export interface CompatibilityEntry {
   target_version: string;
   has_breaking_changes: boolean;
@@ -1750,8 +1780,6 @@ export interface AddCompatibilityRequest {
   stellar_version?: string;
   is_compatible: boolean;
 }
-
-// ─── SDK / Wasm / Network Compatibility Testing (Issue #261) ─────────────────
 
 export type CompatibilityTestStatus = "compatible" | "warning" | "incompatible";
 
@@ -1824,8 +1852,6 @@ export interface CompatibilityDashboardResponse {
   recent_changes: CompatibilityHistoryEntry[];
 }
 
-// ─── Database Migration Versioning (Issue #252) ──────────────────────────────
-
 export interface SchemaVersion {
   id: number;
   version: number;
@@ -1889,8 +1915,6 @@ export interface LockStatusResponse {
   locked_at?: string;
 }
 
-// ─── Formal Verification ─────────────────────────────────────────────────────
-
 export type VerificationStatus = "Proved" | "Violated" | "Unknown" | "Skipped";
 
 export interface FormalVerificationSession {
@@ -1926,7 +1950,6 @@ export interface FormalVerificationPropertyResult {
 
 export interface FormalVerificationReport {
   session: FormalVerificationSession;
-
   properties: FormalVerificationPropertyResult[];
 }
 
@@ -1934,8 +1957,6 @@ export interface RunVerificationRequest {
   properties_file: string;
   verifier_version?: string;
 }
-
-// ─── Advanced Search & Favorites (Issue #51) ─────────────────────────────────
 
 export type QueryOperator = "AND" | "OR";
 export type FieldOperator =
@@ -1982,8 +2003,6 @@ export interface SaveFavoriteSearchRequest {
   name: string;
   query: QueryNode;
 }
-
-// ─── Comment / Discussion (Issue #516) ───────────────────────────────────────
 
 export interface Comment {
   id: string;

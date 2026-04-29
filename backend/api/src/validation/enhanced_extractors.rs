@@ -101,7 +101,10 @@ impl ValidationRule {
 /// ```
 pub fn validate_request(
     rules: Vec<ValidationRule>,
-) -> impl Fn(Request<Body>, Next) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
+) -> impl Fn(
+    Request<Body>,
+    Next,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>
        + Clone
        + Send
        + 'static {
