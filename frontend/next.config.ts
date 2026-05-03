@@ -6,7 +6,11 @@ const apiOrigin =
   "http://localhost:3001";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  // NOTE: `output: "standalone"` is intentionally omitted here.
+  // It is incompatible with Vercel deployments — Vercel manages its own
+  // output format and the standalone mode causes the build to fail on their
+  // platform. Use the Dockerfile (which sets NODE_ENV=production and copies
+  // the standalone folder) for self-hosted / Docker deployments instead.
   images: {
     formats: ["image/avif", "image/webp"],
     remotePatterns: [
