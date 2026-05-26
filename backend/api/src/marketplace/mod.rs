@@ -23,6 +23,8 @@ pub mod models;
 pub mod pricing_handlers;
 pub mod stripe;
 pub mod stripe_handlers;
+pub mod usdc;
+pub mod usdc_handlers;
 
 pub use license::LicenseSigner;
 

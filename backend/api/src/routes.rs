@@ -9,7 +9,8 @@ use crate::{
     deprecation_handlers, error_logging, formal_verification_handlers, gas_estimation_handlers,
     governance_handlers, graph_analysis_handlers, handlers, interoperability_handlers,
     marketplace::{license_handlers as mp_license, metering as mp_metering,
-                  pricing_handlers as mp_pricing, stripe_handlers as mp_stripe},
+                  pricing_handlers as mp_pricing, stripe_handlers as mp_stripe,
+                  usdc_handlers as mp_usdc},
     metrics_handler, migration_handlers, mutation_testing_handlers, org_handlers, patch_handlers,
     performance_handlers, plugin_marketplace_handlers, publisher_verification_handlers,
     recommendation_handlers, resource_handlers, search_postgres, security_scan_handlers,
@@ -184,6 +185,19 @@ pub fn marketplace_routes() -> Router<AppState> {
         .route(
             "/api/marketplace/stripe/webhook",
             post(mp_stripe::webhook),
+        )
+        // Phase 3 — USDC on Stellar: payment intents + confirm
+        .route(
+            "/api/contracts/:contract_id/usdc-intents",
+            post(mp_usdc::create_intent),
+        )
+        .route(
+            "/api/marketplace/usdc/confirm",
+            post(mp_usdc::confirm_intent),
+        )
+        .route(
+            "/api/marketplace/usdc-payments/:payment_id",
+            get(mp_usdc::get_intent),
         )
 }
 
