@@ -1684,6 +1684,51 @@ pub enum ContractCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Import contracts into the registry from an external file (#831)
+    ///
+    /// Supports JSON, JSONL (newline-delimited JSON), CSV, and archive formats.
+    ///
+    /// Usage: soroban-registry contract import <INPUT_FILE> [OPTIONS]
+    Import {
+        /// Path to the input file (JSON, JSONL, CSV, or .tar.gz archive)
+        input_file: String,
+
+        /// Input format override (json | jsonl | csv | sqlite | archive).
+        /// Inferred from the file extension when omitted.
+        #[arg(long, short = 'f')]
+        format: Option<String>,
+
+        /// How to handle duplicate contracts: skip | update | fail (default: skip)
+        #[arg(long, default_value = "skip")]
+        on_duplicate: String,
+
+        /// Network alias mappings, e.g. --network-map futurenet=testnet
+        /// May be repeated for multiple aliases.
+        #[arg(long = "network-map")]
+        network_map: Vec<String>,
+
+        /// Preview what would be imported without writing to the registry
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Validate all records before importing; abort on any error
+        #[arg(long)]
+        validate: bool,
+
+        /// Roll back all successful imports if any record fails
+        #[arg(long)]
+        atomic: bool,
+
+        /// Write the JSON import-summary report to this file path
+        /// (prints to stdout when omitted)
+        #[arg(long, short = 'o')]
+        report_output: Option<String>,
+
+        /// Directory for archive extraction (archive format only)
+        #[arg(long, default_value = "./imported")]
+        output_dir: String,
+    },
 }
 
 /// Sub-commands for the `api-key` group (#842)
@@ -2357,16 +2402,20 @@ pub async fn dispatch_command(
                 validate,
                 dry_run
             );
-            crate::import::run(
-                &cli.api_url,
-                &file,
-                format.as_deref(),
-                network,
-                &output_dir,
+            let opts = crate::import::ImportOptions {
+                api_url: &cli.api_url,
+                file_path: &file,
+                format: format.as_deref(),
+                network_flag: network,
+                output_dir: &output_dir,
                 validate,
                 dry_run,
-            )
-            .await?;
+                on_duplicate: crate::import::OnDuplicate::Skip,
+                network_map: std::collections::HashMap::new(),
+                atomic: false,
+                report_output: None,
+            };
+            crate::import::run(opts).await?;
         }
         Commands::Doc {
             contract_path,
@@ -3182,6 +3231,43 @@ pub async fn dispatch_command(
             } => {
                 log::debug!("Command: contract dependency | address={} depth={}", address, depth);
                 contract_dependency::run(&cli.api_url, &address, depth, json).await?;
+            }
+            ContractCommands::Import {
+                input_file,
+                format,
+                on_duplicate,
+                network_map,
+                dry_run,
+                validate,
+                atomic,
+                report_output,
+                output_dir,
+            } => {
+                log::debug!(
+                    "Command: contract import | file={} format={:?} on_duplicate={} dry_run={} validate={} atomic={}",
+                    input_file,
+                    format,
+                    on_duplicate,
+                    dry_run,
+                    validate,
+                    atomic
+                );
+                let dup_strategy = crate::import::OnDuplicate::parse(&on_duplicate)?;
+                let net_map = crate::import::parse_network_map(&network_map)?;
+                let opts = crate::import::ImportOptions {
+                    api_url: &cli.api_url,
+                    file_path: &input_file,
+                    format: format.as_deref(),
+                    network_flag: cli.network.as_deref(),
+                    output_dir: &output_dir,
+                    validate,
+                    dry_run,
+                    on_duplicate: dup_strategy,
+                    network_map: net_map,
+                    atomic,
+                    report_output,
+                };
+                crate::import::run(opts).await?;
             }
         },
         Commands::ApiKey { action } => match action {

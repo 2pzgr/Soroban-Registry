@@ -95,6 +95,8 @@ pub struct AppState {
     pub ai_service: Option<Arc<AIService>>,
     pub state_monitor: Option<Arc<StateMonitorService>>,
     pub rate_limit_state: Arc<RateLimitState>,
+    pub db_breaker: Arc<crate::db_resilience::CircuitBreaker>,
+    pub db_queue: Arc<crate::db_resilience::DbQueue>,
     pub feature_flags: Arc<FeatureFlagManager>,
 }
 
@@ -107,6 +109,8 @@ impl AppState {
         rate_limit_state: Arc<RateLimitState>,
         ai_service: Option<Arc<AIService>>,
         event_broadcaster: broadcast::Sender<RealtimeEvent>,
+        db_breaker: Arc<crate::db_resilience::CircuitBreaker>,
+        db_queue: Arc<crate::db_resilience::DbQueue>,
         feature_flags: Arc<FeatureFlagManager>,
     ) -> Result<Self, shared::error::RegistryError> {
         let config = CacheConfig::from_env();
@@ -164,6 +168,8 @@ impl AppState {
             ai_service,
             state_monitor,
             rate_limit_state,
+            db_breaker,
+            db_queue,
             feature_flags,
         })
     }
