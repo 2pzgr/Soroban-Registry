@@ -1,126 +1,51 @@
-pub mod reviews;
 pub mod compatibility;
+pub mod contract_metadata;
+pub mod reviews;
 pub mod validators;
 
 use crate::validation::extractors::ValidatedJson;
+use crate::validation::handler_requests::BatchContractIdsRequest;
 use axum::{
+    body::Body,
     extract::{
         rejection::{JsonRejection, QueryRejection},
         Path, Query, State,
     },
-    http::{header, HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use flate2::{write::GzEncoder, Compression};
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use shared::models::SourceFormat;
 use shared::{
     pagination::Cursor, AdvancedSearchRequest, AnalyticsEventType, AuditActionType,
-    ChangePublisherRequest, Contract, ContractAuditLog, ContractChangelogEntry,
-    ContractChangelogResponse, ContractDeploymentHistory, ContractExportAcceptedResponse,
-    ContractExportFormat, ContractExportJobStatus, ContractExportMetadata, ContractExportRequest,
-    ContractExportStatusResponse, ContractGetResponse, ContractInteractionResponse,
-    ContractMetadataExportEnvelope, ContractMetadataExportRecord, ContractSearchParams,
-    ContractSource, ContractVersion, CreateContractVersionRequest, CreateInteractionBatchRequest,
-    CreateInteractionRequest, DeploymentHistoryQueryParams, FavoriteSearch, FieldOperator,
-    GraphResponse, InteractionTimeSeriesPoint, InteractionTimeSeriesResponse,
-    InteractionsListResponse, InteractionsQueryParams, Network, NetworkConfig, NetworkEndpoints,
-    NetworkInfo, NetworkListResponse, NetworkStatus, PaginatedResponse, PublishRequest, Publisher,
-    QueryCondition, QueryNode, QueryOperator, SaveFavoriteSearchRequest, SearchSuggestion,
-    SearchSuggestionsResponse, SemVer, TrendingParams, UpdateContractMetadataRequest,
-    UpdateContractStatusRequest, VerifyRequest, NetworkHealth, NetworkHealthResponse,
+    ChangePublisherRequest, Contract, ContractAuditLog, ContractDeploymentHistory,
+    ContractExportAcceptedResponse, ContractExportFormat, ContractExportJobStatus,
+    ContractExportMetadata, ContractExportRequest, ContractExportStatusResponse,
+    ContractGetResponse, ContractInteractionResponse, ContractMetadataExportEnvelope,
+    ContractMetadataExportRecord, ContractSearchParams, ContractSource, ContractVersion,
+    CreateContractVersionRequest, CreateInteractionBatchRequest, CreateInteractionRequest,
+    DeploymentHistoryQueryParams, FavoriteSearch, FieldOperator, GraphResponse,
+    InteractionTimeSeriesPoint, InteractionTimeSeriesResponse, InteractionsListResponse,
+    InteractionsQueryParams, Network, NetworkConfig, NetworkEndpoints, NetworkHealth,
+    NetworkHealthResponse, NetworkInfo, NetworkListResponse, NetworkStatus, PaginatedResponse,
+    PublishRequest, Publisher, QueryCondition, QueryNode, QueryOperator, SaveFavoriteSearchRequest,
+    SearchSuggestion, SearchSuggestionsResponse, SemVer, TrendingParams,
+    UpdateContractMetadataRequest, UpdateContractStatusRequest, VerifyRequest,
 };
 
 // ────────────────────────────────────────────────────────────────────────────
-// Missing Types (Issue #51, #32, etc.)
-// These types were used in handlers.rs but are now missing from the shared crate.
+// NOTE: All types are now imported from the shared crate.
+// Duplicate definitions have been removed to maintain a single source of truth.
 // ────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct AdvancedSearchRequest {
-    pub query: QueryNode,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-    pub sort_by: Option<shared::SortBy>,
-    pub sort_order: Option<shared::SortOrder>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(untagged)]
-pub enum QueryNode {
-    Condition(QueryCondition),
-    Group {
-        operator: QueryOperator,
-        conditions: Vec<QueryNode>,
-    },
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryOperator {
-    And,
-    Or,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct QueryCondition {
-    pub field: String,
-    pub operator: FieldOperator,
-    pub value: serde_json::Value,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldOperator {
-    Eq,
-    Ne,
-    Gt,
-    Lt,
-    In,
-    Contains,
-    StartsWith,
-}
-
-#[derive(Debug, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct FavoriteSearch {
-    pub id: uuid::Uuid,
-    pub name: String,
-    pub query_json: serde_json::Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-pub struct SaveFavoriteSearchRequest {
-    pub name: String,
-    pub query: QueryNode,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct ContractSource {
-    pub id: uuid::Uuid,
-    pub contract_version_id: uuid::Uuid,
-    pub source_format: String,
-    pub storage_backend: String,
-    pub storage_key: String,
-    pub source_hash: String,
-    pub source_size: i64,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct ContractDeployment {
-    pub id: uuid::Uuid,
-    pub contract_id: uuid::Uuid,
-    pub contract_version_id: uuid::Uuid,
-    pub network: shared::Network,
-    pub address: String,
-    pub deployed_at: chrono::DateTime<chrono::Utc>,
-    pub transaction_hash: Option<String>,
-}
-use sqlx::QueryBuilder;
-use std::collections::{HashMap, HashSet};
+use sqlx::{Postgres, QueryBuilder};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path as StdPath, PathBuf};
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -141,22 +66,37 @@ pub struct BatchContractsQuery {
     pub fields: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractStatsResponse {
+    pub contract_id: Uuid,
+    pub usage_count: i64,
+    pub last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 use crate::{
     analytics,
-    auth::AuthClaims,
     breaking_changes::{diff_abi, has_breaking_changes, resolve_abi},
-    contract_events::{ContractEventEnvelope, ContractEventVisibility},
+    contract_events::ContractEventEnvelope,
     dependency,
     error::{ApiError, ApiResult},
     onchain_verification::OnChainVerifier,
-    state::AppState,
-    type_safety::parser::parse_json_spec,
-    type_safety::{generate_openapi, to_json, to_yaml},
+    state::{AppState, ContractEventVisibility},
 };
+
+use contract_abi::{generate_openapi, parse_json_spec, to_json, to_yaml};
 
 pub(crate) fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
     tracing::error!(operation = operation, error = ?err, "database operation failed");
     ApiError::internal("An unexpected database error occurred")
+}
+
+fn maturity_filter_value(maturity: &shared::MaturityLevel) -> &'static str {
+    match maturity {
+        shared::MaturityLevel::Experimental => "experimental",
+        shared::MaturityLevel::Beta => "beta",
+        shared::MaturityLevel::Stable => "stable",
+        shared::MaturityLevel::Production => "production",
+    }
 }
 
 pub(crate) async fn fetch_contract_identity(
@@ -277,14 +217,14 @@ async fn require_multisig_approval_for_sensitive_update(
 
 #[allow(dead_code)]
 fn map_json_rejection(err: JsonRejection) -> ApiError {
-    ApiError::bad_request(
+    ApiError::bad_request_with(
         "InvalidRequest",
         format!("Invalid JSON payload: {}", err.body_text()),
     )
 }
 
 fn map_query_rejection(err: QueryRejection) -> ApiError {
-    ApiError::bad_request(
+    ApiError::bad_request_with(
         "InvalidQuery",
         format!("Invalid query parameters: {}", err.body_text()),
     )
@@ -314,7 +254,7 @@ fn contract_timestamp_for_sort(
     }
 }
 
-async fn track_contract_access(state: &AppState, contract_id: Uuid) {
+pub(crate) async fn track_contract_access(state: &AppState, contract_id: Uuid) {
     let cache_key = contract_id.to_string();
     if !state.cache.should_refresh_contract_access(&cache_key).await {
         return;
@@ -331,7 +271,9 @@ async fn track_contract_access(state: &AppState, contract_id: Uuid) {
 
 const NETWORKS_CACHE_NAMESPACE: &str = "system";
 const NETWORKS_CACHE_KEY: &str = "network_catalog";
+const NETWORKS_V1_CACHE_KEY: &str = "network_catalog_v1";
 const NETWORKS_REFRESH_INTERVAL_SECS: u64 = 60;
+const NETWORKS_V1_CACHE_TTL_SECS: i64 = 15 * 60;
 const NETWORKS_HEALTH_CACHE_NAMESPACE: &str = "health";
 const NETWORKS_HEALTH_CACHE_KEY: &str = "all_networks";
 const NETWORKS_HEALTH_TTL: u64 = 30;
@@ -396,6 +338,10 @@ struct StaticNetworkDefinition {
     id: &'static str,
     name: &'static str,
     network_type: Network,
+    chain_id: &'static str,
+    description: &'static str,
+    logo_url: &'static str,
+    avg_block_time_seconds: f64,
     rpc_url: String,
     explorer_url: String,
     friendbot_url: Option<String>,
@@ -431,6 +377,10 @@ fn configured_networks() -> Vec<StaticNetworkDefinition> {
             "mainnet",
             "Stellar Mainnet",
             Network::Mainnet,
+            "Public Global Stellar Network ; September 2015",
+            "Production Stellar public network for live Soroban contracts and assets.",
+            "https://assets.stellar.org/logos/stellar-logo.svg",
+            5.0,
             "STELLAR_RPC_MAINNET",
             "STELLAR_EXPLORER_MAINNET",
             "STELLAR_FRIENDBOT_MAINNET",
@@ -439,6 +389,10 @@ fn configured_networks() -> Vec<StaticNetworkDefinition> {
             "testnet",
             "Stellar Testnet",
             Network::Testnet,
+            "Test SDF Network ; September 2015",
+            "Public resettable Stellar test network for integration testing.",
+            "https://assets.stellar.org/logos/stellar-logo.svg",
+            5.0,
             "STELLAR_RPC_TESTNET",
             "STELLAR_EXPLORER_TESTNET",
             "STELLAR_FRIENDBOT_TESTNET",
@@ -447,6 +401,10 @@ fn configured_networks() -> Vec<StaticNetworkDefinition> {
             "futurenet",
             "Stellar Futurenet",
             Network::Futurenet,
+            "Test SDF Future Network ; October 2022",
+            "Preview network for upcoming Stellar and Soroban protocol changes.",
+            "https://assets.stellar.org/logos/stellar-logo.svg",
+            5.0,
             "STELLAR_RPC_FUTURENET",
             "STELLAR_EXPLORER_FUTURENET",
             "STELLAR_FRIENDBOT_FUTURENET",
@@ -456,10 +414,25 @@ fn configured_networks() -> Vec<StaticNetworkDefinition> {
     entries
         .into_iter()
         .map(
-            |(id, name, network_type, rpc_env, explorer_env, friendbot_env)| {
+            |(
+                id,
+                name,
+                network_type,
+                chain_id,
+                description,
+                logo_url,
+                avg_block_time_seconds,
+                rpc_env,
+                explorer_env,
+                friendbot_env,
+            )| {
                 StaticNetworkDefinition {
                     id,
                     name,
+                    chain_id,
+                    description,
+                    logo_url,
+                    avg_block_time_seconds,
                     rpc_url: std::env::var(rpc_env)
                         .unwrap_or_else(|_| default_rpc_url(&network_type).to_string()),
                     explorer_url: std::env::var(explorer_env)
@@ -472,6 +445,86 @@ fn configured_networks() -> Vec<StaticNetworkDefinition> {
             },
         )
         .collect()
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct NetworkListV1Query {
+    #[serde(default, rename = "real-time", alias = "real_time")]
+    pub real_time: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkStatusIndicator {
+    Healthy,
+    Degraded,
+    Maintenance,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NetworkStatsV1 {
+    pub contract_count: i64,
+    pub transaction_volume_24h: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NetworkHealthMetricsV1 {
+    pub avg_block_time_seconds: f64,
+    pub validator_count: i64,
+    pub last_indexed_ledger_height: Option<i64>,
+    pub last_indexed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub consecutive_failures: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NetworkInfoV1 {
+    pub name: String,
+    pub chain_id: String,
+    pub network: Network,
+    pub rpc_endpoint: String,
+    pub status: NetworkStatusIndicator,
+    pub description: String,
+    pub logo_url: String,
+    pub explorer_url: String,
+    pub friendbot_url: Option<String>,
+    pub stats: NetworkStatsV1,
+    pub health: NetworkHealthMetricsV1,
+    pub last_checked_at: chrono::DateTime<chrono::Utc>,
+    pub status_message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct NetworkListResponseV1 {
+    pub networks: Vec<NetworkInfoV1>,
+    pub cached_at: chrono::DateTime<chrono::Utc>,
+    pub cache_ttl_seconds: i64,
+    pub real_time: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct NetworkStatsRow {
+    network: Network,
+    contract_count: i64,
+    transaction_volume_24h: i64,
+}
+
+fn network_maintenance_override(network_id: &str) -> bool {
+    let env_name = format!("STELLAR_NETWORK_{}_MAINTENANCE", network_id.to_uppercase());
+    std::env::var(env_name)
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn status_indicator(network_id: &str, status: &NetworkStatus) -> NetworkStatusIndicator {
+    if network_maintenance_override(network_id) {
+        return NetworkStatusIndicator::Maintenance;
+    }
+
+    match status {
+        NetworkStatus::Online => NetworkStatusIndicator::Healthy,
+        NetworkStatus::Degraded => NetworkStatusIndicator::Degraded,
+        NetworkStatus::Offline => NetworkStatusIndicator::Maintenance,
+    }
 }
 
 fn derive_network_status(
@@ -604,6 +657,133 @@ async fn refresh_network_catalog_cache(state: &AppState) -> Result<NetworkListRe
     Ok(response)
 }
 
+async fn fetch_network_stats(
+    db: &sqlx::PgPool,
+) -> Result<HashMap<String, NetworkStatsV1>, sqlx::Error> {
+    let rows: Vec<NetworkStatsRow> = sqlx::query_as(
+        r#"
+        SELECT
+            c.network,
+            COUNT(DISTINCT c.id)::BIGINT AS contract_count,
+            COALESCE((
+                SELECT SUM(ci.interaction_count)
+                FROM contract_interactions ci
+                WHERE ci.network = c.network
+                  AND ci.created_at >= NOW() - INTERVAL '24 hours'
+            ), 0)::BIGINT AS transaction_volume_24h
+        FROM contracts c
+        GROUP BY c.network
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.network.to_string(),
+                NetworkStatsV1 {
+                    contract_count: row.contract_count,
+                    transaction_volume_24h: row.transaction_volume_24h,
+                },
+            )
+        })
+        .collect())
+}
+
+async fn fetch_active_validator_count(db: &sqlx::PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM validators WHERE status = 'active'")
+        .fetch_one(db)
+        .await
+}
+
+async fn fetch_network_catalog_v1(
+    state: &AppState,
+    real_time: bool,
+) -> Result<NetworkListResponseV1, ApiError> {
+    let catalog = fetch_network_catalog(&state.db)
+        .await
+        .map_err(|err| db_internal_error("fetch network catalog v1", err))?;
+    let stats = fetch_network_stats(&state.db)
+        .await
+        .map_err(|err| db_internal_error("fetch network stats", err))?;
+    let validator_count = fetch_active_validator_count(&state.db)
+        .await
+        .map_err(|err| db_internal_error("fetch validator count", err))?;
+    let definitions: HashMap<&'static str, StaticNetworkDefinition> = configured_networks()
+        .into_iter()
+        .map(|definition| (definition.id, definition))
+        .collect();
+
+    let networks = catalog
+        .networks
+        .into_iter()
+        .map(|network| {
+            let definition = definitions
+                .get(network.id.as_str())
+                .expect("configured network definition exists");
+            let network_stats =
+                stats
+                    .get(&network.network_type.to_string())
+                    .cloned()
+                    .unwrap_or(NetworkStatsV1 {
+                        contract_count: 0,
+                        transaction_volume_24h: 0,
+                    });
+
+            NetworkInfoV1 {
+                name: network.name,
+                chain_id: definition.chain_id.to_string(),
+                network: network.network_type,
+                rpc_endpoint: network.endpoints.rpc_url,
+                status: status_indicator(definition.id, &network.status),
+                description: definition.description.to_string(),
+                logo_url: definition.logo_url.to_string(),
+                explorer_url: network.endpoints.explorer_url,
+                friendbot_url: network.endpoints.friendbot_url,
+                stats: network_stats,
+                health: NetworkHealthMetricsV1 {
+                    avg_block_time_seconds: definition.avg_block_time_seconds,
+                    validator_count,
+                    last_indexed_ledger_height: network.last_indexed_ledger_height,
+                    last_indexed_at: network.last_indexed_at,
+                    consecutive_failures: network.consecutive_failures,
+                },
+                last_checked_at: network.last_checked_at,
+                status_message: network.status_message,
+            }
+        })
+        .collect();
+
+    Ok(NetworkListResponseV1 {
+        networks,
+        cached_at: chrono::Utc::now(),
+        cache_ttl_seconds: NETWORKS_V1_CACHE_TTL_SECS,
+        real_time,
+    })
+}
+
+async fn refresh_network_catalog_v1_cache(
+    state: &AppState,
+) -> Result<NetworkListResponseV1, ApiError> {
+    let response = fetch_network_catalog_v1(state, false).await?;
+
+    if let Ok(serialized) = serde_json::to_string(&response) {
+        state
+            .cache
+            .put(
+                NETWORKS_CACHE_NAMESPACE,
+                NETWORKS_V1_CACHE_KEY,
+                serialized,
+                Some(Duration::from_secs(NETWORKS_V1_CACHE_TTL_SECS as u64)),
+            )
+            .await;
+    }
+
+    Ok(response)
+}
+
 pub async fn run_network_catalog_refresh(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(NETWORKS_REFRESH_INTERVAL_SECS));
 
@@ -672,7 +852,7 @@ fn validate_contract_list_pagination(
 ) -> Result<(i64, i64, i64), ApiError> {
     let limit = params.limit.unwrap_or(DEFAULT_CONTRACT_LIST_LIMIT);
     if !(1..=MAX_CONTRACT_LIST_LIMIT).contains(&limit) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::bad_request_with(
             "InvalidPaginationLimit",
             format!(
                 "Invalid `limit` value {limit}. Expected an integer between 1 and {MAX_CONTRACT_LIST_LIMIT}."
@@ -682,7 +862,7 @@ fn validate_contract_list_pagination(
 
     if let Some(offset) = params.offset {
         if offset < 0 {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_with(
                 "InvalidPaginationOffset",
                 format!("Invalid `offset` value {offset}. Expected a non-negative integer."),
             ));
@@ -697,7 +877,7 @@ fn validate_contract_list_pagination(
     Ok((limit, offset, page))
 }
 
-fn extract_ip_address(headers: &HeaderMap) -> String {
+pub(crate) fn extract_ip_address(headers: &HeaderMap) -> String {
     if let Some(forwarded_for) = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
@@ -772,7 +952,7 @@ fn contract_to_filtered_value(contract: &Contract, fields: Option<&HashSet<Strin
     Value::Object(out)
 }
 
-async fn write_contract_audit_log(
+pub(crate) async fn write_contract_audit_log(
     db: &sqlx::PgPool,
     action_type: AuditActionType,
     contract_id: Uuid,
@@ -888,7 +1068,7 @@ fn parse_interaction_type(
     );
 
     if !valid {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::bad_request_with(
             "InvalidInteractionType",
             format!(
                 "interaction_type '{}' is invalid; expected one of: deploy, invoke, transfer, query, publish_success, publish_failed",
@@ -1213,6 +1393,12 @@ pub async fn health_check_detailed(State(state): State<AppState>) -> (StatusCode
     tag = "Observability"
 )]
 pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    if let Some(cached) = state.cache.get_stats("global").await {
+        if let Ok(val) = serde_json::from_str::<Value>(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let total_contracts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts")
         .fetch_one(&state.db)
         .await
@@ -1229,11 +1415,17 @@ pub async fn get_stats(State(state): State<AppState>) -> ApiResult<Json<Value>> 
         .await
         .map_err(|err| db_internal_error("count publishers", err))?;
 
-    Ok(Json(json!({
+    let stats = json!({
         "total_contracts": total_contracts,
         "verified_contracts": verified_contracts,
         "total_publishers": total_publishers,
-    })))
+    });
+
+    if let Ok(serialized) = serde_json::to_string(&stats) {
+        state.cache.put_stats("global", serialized).await;
+    }
+
+    Ok(Json(stats))
 }
 
 #[utoipa::path(
@@ -1261,13 +1453,49 @@ pub async fn list_networks(State(state): State<AppState>) -> ApiResult<Json<Netw
 
 #[utoipa::path(
     get,
+    path = "/api/v1/networks",
+    params(NetworkListV1Query),
+    responses(
+        (status = 200, description = "Supported Soroban networks with stats and health metadata", body = NetworkListResponseV1)
+    ),
+    tag = "Networks"
+)]
+pub async fn list_networks_v1(
+    State(state): State<AppState>,
+    Query(query): Query<NetworkListV1Query>,
+) -> ApiResult<Json<NetworkListResponseV1>> {
+    if query.real_time {
+        return Ok(Json(fetch_network_catalog_v1(&state, true).await?));
+    }
+
+    if let (Some(cached), true) = state
+        .cache
+        .get(NETWORKS_CACHE_NAMESPACE, NETWORKS_V1_CACHE_KEY)
+        .await
+    {
+        if let Ok(payload) = serde_json::from_str::<NetworkListResponseV1>(&cached) {
+            let cache_age = chrono::Utc::now() - payload.cached_at;
+            if cache_age.num_seconds() < NETWORKS_V1_CACHE_TTL_SECS {
+                return Ok(Json(payload));
+            }
+        }
+    }
+
+    let response = refresh_network_catalog_v1_cache(&state).await?;
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/networks/health",
     responses(
         (status = 200, description = "Current health status of all networks", body = NetworkHealthResponse)
     ),
     tag = "Networks"
 )]
-pub async fn get_network_health(State(state): State<AppState>) -> ApiResult<Json<NetworkHealthResponse>> {
+pub async fn get_network_health(
+    State(state): State<AppState>,
+) -> ApiResult<Json<NetworkHealthResponse>> {
     if let (Some(cached), true) = state
         .cache
         .get(NETWORKS_HEALTH_CACHE_NAMESPACE, NETWORKS_HEALTH_CACHE_KEY)
@@ -1280,19 +1508,20 @@ pub async fn get_network_health(State(state): State<AppState>) -> ApiResult<Json
 
     let catalog = fetch_network_catalog(&state.db).await?;
     let now = chrono::Utc::now();
-    
+
     let mut health = Vec::new();
     for net in catalog.networks {
         let rpc_available = net.status == NetworkStatus::Online;
-        
+
         // In a real scenario, we would fetch the current ledger height from the RPC here
         // For this task, we will simulate it by adding a small random lag if it's available
         let current_ledger = net.last_indexed_ledger_height.map(|h| (h + 5) as u32);
-        let indexer_lag = if let (Some(last), Some(curr)) = (net.last_indexed_ledger_height, current_ledger) {
-            Some((curr as i64) - last)
-        } else {
-            None
-        };
+        let indexer_lag =
+            if let (Some(last), Some(curr)) = (net.last_indexed_ledger_height, current_ledger) {
+                Some((curr as i64) - last)
+            } else {
+                None
+            };
 
         health.push(NetworkHealth {
             network_id: net.id,
@@ -1312,12 +1541,15 @@ pub async fn get_network_health(State(state): State<AppState>) -> ApiResult<Json
     };
 
     if let Ok(serialized) = serde_json::to_string(&response) {
-        state.cache.put(
-            NETWORKS_HEALTH_CACHE_NAMESPACE,
-            NETWORKS_HEALTH_CACHE_KEY,
-            serialized,
-            Some(Duration::from_secs(NETWORKS_HEALTH_TTL)),
-        ).await;
+        state
+            .cache
+            .put(
+                NETWORKS_HEALTH_CACHE_NAMESPACE,
+                NETWORKS_HEALTH_CACHE_KEY,
+                serialized,
+                Some(Duration::from_secs(NETWORKS_HEALTH_TTL)),
+            )
+            .await;
     }
 
     Ok(Json(response))
@@ -1439,12 +1671,19 @@ pub async fn get_contract_search_suggestions(
     tag = "Contracts"
 )]
 pub async fn list_tags(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let rows = sqlx::query!(
-        "SELECT t.id, t.name, t.color, COUNT(ct.contract_id)::INT as usage_count \
+    #[derive(sqlx::FromRow)]
+    struct TagRow {
+        id: uuid::Uuid,
+        name: String,
+        color: Option<String>,
+        usage_count: Option<i32>,
+    }
+    let rows = sqlx::query_as::<_, TagRow>(
+        "SELECT t.id, t.name, t.color, COUNT(ct.contract_id)::INT AS usage_count \
          FROM tags t \
          LEFT JOIN contract_tags ct ON t.id = ct.tag_id \
          GROUP BY t.id \
-         ORDER BY usage_count DESC, t.name ASC"
+         ORDER BY usage_count DESC, t.name ASC",
     )
     .fetch_all(&state.db)
     .await
@@ -1495,6 +1734,24 @@ pub async fn list_contracts(
     let (limit, offset, page) = match validate_contract_list_pagination(&params) {
         Ok(values) => values,
         Err(err) => return err.into_response(),
+    };
+
+    let cursor = if let Some(cursor_str) = &params.cursor {
+        match shared::pagination::Cursor::decode(cursor_str) {
+            Ok(c) => Some(c),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "InvalidPaginationCursor",
+                        "message": format!("The provided pagination cursor is invalid: {}", err)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
     };
 
     let sort_by = params.sort_by.clone().unwrap_or(shared::SortBy::CreatedAt);
@@ -1571,33 +1828,76 @@ pub async fn list_contracts(
 
     if let Some(q) = &params.query {
         let like = format!("%{}%", q.to_ascii_lowercase());
-        qb.push(" AND (lower(c.name) LIKE ");
-        qb.push_bind(like.clone());
-        qb.push(" OR lower(COALESCE(c.description, '')) LIKE ");
+        qb.push(" AND (c.search_vector @@ plainto_tsquery('english', ");
+        qb.push_bind(q);
+        qb.push(") OR lower(c.contract_id) LIKE ");
         qb.push_bind(like);
         qb.push(")");
     }
 
+    // Cursor pagination condition
+    if let Some(cursor) = &cursor {
+        let op = if sort_order == shared::SortOrder::Asc {
+            ">"
+        } else {
+            "<"
+        };
+        qb.push(" AND (c.created_at ");
+        qb.push(op);
+        qb.push(" ");
+        qb.push_bind(cursor.timestamp);
+        qb.push(" OR (c.created_at = ");
+        qb.push_bind(cursor.timestamp);
+        qb.push(" AND c.id ");
+        qb.push(op);
+        qb.push(" ");
+        qb.push_bind(cursor.id);
+        qb.push("))");
+    }
+
     qb.push(" GROUP BY c.id");
     qb.push(" ORDER BY ");
-    match sort_by {
-        shared::SortBy::UpdatedAt => qb.push("c.updated_at "),
-        shared::SortBy::VerifiedAt => qb.push("c.verified_at "),
-        shared::SortBy::LastAccessedAt => qb.push("c.last_accessed_at "),
-        shared::SortBy::Popularity | shared::SortBy::Interactions => qb.push("COUNT(ci.id) "),
-        shared::SortBy::Deployments => {
-            qb.push("SUM(CASE WHEN ci.interaction_type = 'deploy' THEN 1 ELSE 0 END) ")
+    if cursor.is_some() {
+        qb.push("c.created_at ");
+    } else {
+        match sort_by {
+            shared::SortBy::UpdatedAt => {
+                qb.push("c.updated_at ");
+            }
+            shared::SortBy::VerifiedAt => {
+                qb.push("c.verified_at ");
+            }
+            shared::SortBy::LastAccessedAt => {
+                qb.push("c.last_accessed_at ");
+            }
+            shared::SortBy::Popularity | shared::SortBy::Interactions => {
+                qb.push("COUNT(ci.id) ");
+            }
+            shared::SortBy::Deployments => {
+                qb.push("SUM(CASE WHEN ci.interaction_type = 'deploy' THEN 1 ELSE 0 END) ");
+            }
+            shared::SortBy::Relevance if params.query.is_some() => {
+                qb.push("c.created_at ");
+            }
+            _ => {
+                qb.push("c.created_at ");
+            }
         }
-        shared::SortBy::Relevance if params.query.is_some() => qb.push("c.created_at "),
-        _ => qb.push("c.created_at "),
-    };
+    }
     qb.push(direction);
+
     qb.push(", c.id ");
     qb.push(direction);
+
+    // Fetch one extra item to check for next page
+    let fetch_limit = limit + 1;
     qb.push(" LIMIT ");
-    qb.push_bind(limit);
-    qb.push(" OFFSET ");
-    qb.push_bind(offset);
+    qb.push_bind(fetch_limit);
+
+    if cursor.is_none() {
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+    }
 
     let mut contracts: Vec<Contract> = match qb.build_query_as().fetch_all(&state.db).await {
         Ok(rows) => rows,
@@ -1607,15 +1907,22 @@ pub async fn list_contracts(
     // Fetch tags for these contracts
     let contract_ids: Vec<Uuid> = contracts.iter().map(|c| c.id).collect();
     if !contract_ids.is_empty() {
-        let tag_rows = match sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct TagRow {
+            contract_id: Uuid,
+            id: Uuid,
+            name: String,
+            color: String,
+        }
+        let tag_rows = match sqlx::query_as::<_, TagRow>(
             r#"
             SELECT ct.contract_id, t.id, t.name, t.color
             FROM tags t
             JOIN contract_tags ct ON t.id = ct.tag_id
             WHERE ct.contract_id = ANY($1)
             "#,
-            &contract_ids
         )
+        .bind(&contract_ids)
         .fetch_all(&state.db)
         .await
         {
@@ -1700,9 +2007,9 @@ pub async fn list_contracts(
     }
     if let Some(q) = &params.query {
         let like = format!("%{}%", q.to_ascii_lowercase());
-        count_qb.push(" AND (lower(c.name) LIKE ");
-        count_qb.push_bind(like.clone());
-        count_qb.push(" OR lower(COALESCE(c.description, '')) LIKE ");
+        count_qb.push(" AND (c.search_vector @@ plainto_tsquery('english', ");
+        count_qb.push_bind(q);
+        count_qb.push(") OR lower(c.contract_id) LIKE ");
         count_qb.push_bind(like);
         count_qb.push(")");
     }
@@ -1712,15 +2019,48 @@ pub async fn list_contracts(
         Err(err) => return db_internal_error("count contracts", err).into_response(),
     };
 
-    let response = PaginatedResponse::new(contracts, total, page, limit);
+    let mut has_more = contracts.len() > limit as usize;
+    if has_more {
+        contracts.truncate(limit as usize);
+    }
+
+    let mut response = PaginatedResponse::new(contracts, total, page, limit);
+
+    if has_more {
+        if let Some(last_item) = response.items.last() {
+            let next_cursor = shared::pagination::Cursor::new(last_item.created_at, last_item.id);
+            response.next_cursor = Some(next_cursor.encode());
+        }
+    }
+
     observe_search_query(
         "contracts",
         search_started_at,
         params.query.as_deref(),
         limit,
     );
+
+    // Write to cache after successful DB fetch
+    if !cache_key.is_empty() {
+        if let Ok(serialized) = serde_json::to_string(&response) {
+            state.cache.put_contracts(cache_key, serialized).await;
+        }
+    }
+
     Json(response).into_response()
 }
+
+#[utoipa::path(
+    get,
+    path = "/api/contracts",
+    params(ContractSearchParams),
+    responses(
+        (status = 200, description = "List of contracts", body = PaginatedResponse<Contract>),
+        (status = 400, description = "Invalid query parameters")
+    ),
+    tag = "Contracts"
+)]
+pub async fn list_contracts_openapi_marker() {}
 
 fn csv_escape(value: &str) -> String {
     let needs_quotes = value.contains(',') || value.contains('\"') || value.contains('\n');
@@ -1851,6 +2191,60 @@ fn render_contract_export(
             }
             Ok(csv)
         }
+    }
+}
+
+fn sanitized_export_filters(filters: ContractSearchParams) -> ContractSearchParams {
+    filters
+}
+
+fn export_artifact_path(job_id: Uuid, format: &ContractExportFormat) -> PathBuf {
+    std::env::temp_dir()
+        .join("soroban-registry")
+        .join("contract-exports")
+        .join(format!("{}.{}", job_id, format))
+}
+
+fn contract_export_response(
+    format: &ContractExportFormat,
+    rendered_count: i64,
+    content: String,
+) -> Response {
+    let content_type = match format {
+        ContractExportFormat::Json => "application/json; charset=utf-8",
+        ContractExportFormat::Yaml => "application/yaml; charset=utf-8",
+        ContractExportFormat::Csv => "text/csv; charset=utf-8",
+    };
+
+    let mut response = content.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(content_type),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&format!(
+            "attachment; filename=contract-export-{}.{}",
+            rendered_count, format
+        ))
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("attachment")),
+    );
+    response
+}
+
+fn build_export_status_response(job: &ContractExportJob) -> ContractExportStatusResponse {
+    ContractExportStatusResponse {
+        job_id: job.job_id,
+        status: job.status.clone(),
+        status_url: format!("/contracts/export/{}", job.job_id),
+        download_url: matches!(job.status, ContractExportJobStatus::Completed)
+            .then(|| format!("/contracts/export/{}/download", job.job_id)),
+        total_count: job.total_count,
+        format: job.format.clone(),
+        requested_at: job.requested_at,
+        completed_at: job.completed_at,
+        filters: job.filters.clone(),
+        error: job.error.clone(),
     }
 }
 
@@ -2068,10 +2462,17 @@ async fn fetch_contract_export_rows(
     // Fetch tags for these records
     let record_ids: Vec<Uuid> = records.iter().map(|r| r.id).collect();
     if !record_ids.is_empty() {
-        let tag_rows = match sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct TagRow {
+            contract_id: Uuid,
+            id: Uuid,
+            name: String,
+            color: String,
+        }
+        let tag_rows = match sqlx::query_as::<_, TagRow>(
             "SELECT ct.contract_id, t.id, t.name, t.color FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = ANY($1)",
-            &record_ids
         )
+        .bind(&record_ids)
         .fetch_all(&state.db)
         .await {
             Ok(rows) => rows,
@@ -2321,6 +2722,27 @@ pub async fn get_contract(
     Path(id): Path<String>,
     Query(query): Query<GetContractQuery>,
 ) -> ApiResult<Json<ContractGetResponse>> {
+    // Only cache public contract fetches (no auth context, no network override)
+    // to avoid leaking private data through the cache.
+    let cache_key = if claims.is_none() && query.network.is_none() {
+        Some(id.clone())
+    } else {
+        None
+    };
+
+    if let Some(ref key) = cache_key {
+        if let Some(cached) = state.cache.get_contract_meta(key).await {
+            if let Ok(contract) = serde_json::from_str::<Contract>(&cached) {
+                track_contract_access(&state, contract.id).await;
+                return Ok(Json(ContractGetResponse {
+                    contract,
+                    current_network: None,
+                    network_config: None,
+                }));
+            }
+        }
+    }
+
     let mut contract: Contract = if let Ok(contract_uuid) = Uuid::parse_str(&id) {
         sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
             .bind(contract_uuid)
@@ -2354,10 +2776,16 @@ pub async fn get_contract(
     };
 
     // Fetch tags
-    let tag_rows = match sqlx::query!(
+    #[derive(sqlx::FromRow)]
+    struct TagRow {
+        id: Uuid,
+        name: String,
+        color: String,
+    }
+    let tag_rows = match sqlx::query_as::<_, TagRow>(
         "SELECT t.id, t.name, t.color FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
-        contract.id
     )
+    .bind(contract.id)
     .fetch_all(&state.db)
     .await {
         Ok(rows) => rows,
@@ -2372,6 +2800,19 @@ pub async fn get_contract(
             color: r.color,
         })
         .collect();
+
+    // Cache public contracts after tags are populated
+    if contract.visibility == shared::VisibilityType::Public {
+        if let Some(ref key) = cache_key {
+            if let Ok(serialized) = serde_json::to_string(&contract) {
+                state.cache.put_contract_meta(key, serialized.clone()).await;
+                // Also cache by the canonical contract_id string so both UUID and slug lookups hit
+                if key != &contract.contract_id {
+                    state.cache.put_contract_meta(&contract.contract_id, serialized).await;
+                }
+            }
+        }
+    }
 
     // Visibility check
     if contract.visibility == shared::VisibilityType::Private {
@@ -2436,6 +2877,22 @@ pub async fn get_contract(
     }
     track_contract_access(&state, contract.id).await;
 
+    // Increment usage counter asynchronously (fire-and-forget)
+    // Failures are logged but never block the main request
+    let contract_id = contract.id;
+    let db_clone = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::usage_counter::increment_usage_counter_with_timeout(contract_id, &db_clone).await
+        {
+            tracing::warn!(
+                contract_id = %contract_id,
+                error = ?err,
+                "Failed to increment usage counter for contract"
+            );
+        }
+    });
+
     Ok(Json(ContractGetResponse {
         contract,
         current_network,
@@ -2458,7 +2915,7 @@ pub async fn get_contract(
 pub async fn get_contracts_batch(
     State(state): State<AppState>,
     Query(query): Query<BatchContractsQuery>,
-    Json(contract_ids): Json<Vec<String>>,
+    ValidatedJson(contract_ids): ValidatedJson<BatchContractIdsRequest>,
 ) -> ApiResult<Json<Vec<Option<Value>>>> {
     if contract_ids.len() > 100 {
         return Err(ApiError::bad_request(
@@ -2730,7 +3187,7 @@ pub async fn revert_contract_version(
     State(state): State<AppState>,
     Path((id, target_version)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(req): Json<shared::RevertVersionRequest>,
+    ValidatedJson(req): ValidatedJson<shared::RevertVersionRequest>,
 ) -> ApiResult<Json<ContractVersion>> {
     let (contract_uuid, contract_id) = fetch_contract_identity(&state, &id).await?;
 
@@ -2833,6 +3290,8 @@ pub async fn revert_contract_version(
     state.cache.invalidate_abi(&contract_id).await;
     state.cache.invalidate_abi(&contract_uuid.to_string()).await;
     state.cache.invalidate_contracts().await;
+    state.cache.invalidate_contract_meta(&contract_id).await;
+    state.cache.invalidate_contract_meta(&contract_uuid.to_string()).await;
 
     Ok(Json(version_row))
 }
@@ -2854,6 +3313,23 @@ pub struct ContractSourceResponse {
     pub source_size: i64,
     pub source_base64: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractChangelogEntry {
+    pub version: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub commit_hash: Option<String>,
+    pub source_url: Option<String>,
+    pub release_notes: Option<String>,
+    pub breaking: bool,
+    pub breaking_changes: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct ContractChangelogResponse {
+    pub contract_id: Uuid,
+    pub entries: Vec<ContractChangelogEntry>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::IntoParams)]
@@ -2888,7 +3364,7 @@ pub struct ContractSourceDiffResponse {
 pub async fn upload_contract_source(
     State(state): State<AppState>,
     Path((id, version)): Path<(String, String)>,
-    Json(req): Json<UploadContractSourceRequest>,
+    ValidatedJson(req): ValidatedJson<UploadContractSourceRequest>,
 ) -> ApiResult<Json<ContractSourceResponse>> {
     let (contract_uuid, contract_id) = fetch_contract_identity(&state, &id).await?;
 
@@ -3239,12 +3715,12 @@ pub async fn get_contract_changelog(
             let old_abi = resolve_abi(&state, &old_selector, false).await?;
             let new_abi = resolve_abi(&state, &new_selector, false).await?;
 
-            let old_spec = crate::type_safety::parser::parse_json_spec(&old_abi, &old_selector)
-                .map_err(|e| {
+            let old_spec =
+                contract_abi::parser::parse_json_spec(&old_abi, &old_selector).map_err(|e| {
                     ApiError::bad_request("InvalidABI", format!("Failed to parse old ABI: {}", e))
                 })?;
-            let new_spec = crate::type_safety::parser::parse_json_spec(&new_abi, &new_selector)
-                .map_err(|e| {
+            let new_spec =
+                contract_abi::parser::parse_json_spec(&new_abi, &new_selector).map_err(|e| {
                     ApiError::bad_request("InvalidABI", format!("Failed to parse new ABI: {}", e))
                 })?;
 
@@ -3425,19 +3901,18 @@ pub async fn create_contract_version(
         if let Some(old_version) = latest_version {
             let old_selector = format!("{}@{}", contract_id, old_version);
             let old_abi = resolve_abi(&state, &old_selector, false).await?;
-            let old_spec = crate::type_safety::parser::parse_json_spec(&old_abi, &contract_id)
-                .map_err(|e| {
+            let old_spec =
+                contract_abi::parser::parse_json_spec(&old_abi, &contract_id).map_err(|e| {
                     ApiError::bad_request("InvalidABI", format!("Failed to parse old ABI: {}", e))
                 })?;
 
-            let new_spec =
-                crate::type_safety::parser::parse_json_spec(&req.abi.to_string(), &contract_id)
-                    .map_err(|e| {
-                        ApiError::bad_request(
-                            "InvalidABI",
-                            format!("Failed to parse new ABI: {}", e),
-                        )
-                    })?;
+            let new_spec = contract_abi::parser::parse_json_spec(
+                &req.abi.to_string(),
+                &contract_id,
+            )
+            .map_err(|e| {
+                ApiError::bad_request("InvalidABI", format!("Failed to parse new ABI: {}", e))
+            })?;
 
             let changes = diff_abi(&old_spec, &new_spec);
             if has_breaking_changes(&changes) && new_version.major == old_version.major {
@@ -3563,6 +4038,8 @@ pub async fn create_contract_version(
         .cache
         .invalidate_abi(&format!("{}@{}", contract_id, req.version))
         .await;
+    state.cache.invalidate_contract_meta(&contract_id).await;
+    state.cache.invalidate_contract_meta(&contract_uuid.to_string()).await;
 
     // Store differential patch for the new version (Issue #501).
     let new_snapshot = crate::patch_handlers::VersionSnapshot {
@@ -3632,6 +4109,22 @@ pub async fn create_contract_version(
             ));
     }
     state.cache.invalidate_contracts().await;
+
+    // Increment usage counter asynchronously (fire-and-forget)
+    // Failures are logged but never block the main request
+    let db_clone = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::usage_counter::increment_usage_counter_with_timeout(contract_uuid, &db_clone)
+                .await
+        {
+            tracing::warn!(
+                contract_id = %contract_uuid,
+                error = ?err,
+                "Failed to increment usage counter for contract"
+            );
+        }
+    });
 
     Ok(Json(version_row))
 }
@@ -3915,6 +4408,22 @@ pub async fn publish_contract(
     }
 
     state.cache.invalidate_contracts().await;
+
+    // Increment usage counter asynchronously (fire-and-forget)
+    // Failures are logged but never block the main request
+    let contract_id = contract.id;
+    let db_clone = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::usage_counter::increment_usage_counter_with_timeout(contract_id, &db_clone).await
+        {
+            tracing::warn!(
+                contract_id = %contract_id,
+                error = ?err,
+                "Failed to increment usage counter for contract"
+            );
+        }
+    });
     Ok(Json(contract))
 }
 
@@ -4054,6 +4563,17 @@ pub async fn get_publisher_contracts(
 pub struct ContractAbiQuery {
     pub version: Option<String>,
     pub bypass_cache: Option<bool>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ContractAbiRow {
+    contract_uuid: Uuid,
+    contract_id: String,
+    version: Option<String>,
+    abi: Value,
+    compiler: Option<String>,
+    generated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Fetch ABI JSON string for contract (by id or id@version)
@@ -4089,12 +4609,190 @@ pub async fn get_contract_abi(
     Path(id): Path<String>,
     Query(query): Query<ContractAbiQuery>,
     State(state): State<AppState>,
-) -> ApiResult<Json<Value>> {
-    let bypass = query.bypass_cache.unwrap_or(false);
-    let abi_json = resolve_contract_abi(&state, &id, query.version.as_deref(), bypass).await?;
-    let abi: Value = serde_json::from_str(&abi_json)
-        .map_err(|e| ApiError::internal(format!("Invalid ABI JSON: {}", e)))?;
-    Ok(Json(json!({ "abi": abi })))
+) -> ApiResult<Response> {
+    build_contract_abi_response(HeaderMap::new(), Path(id), Query(query), State(state)).await
+}
+
+pub async fn get_contract_abi_v1(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ContractAbiQuery>,
+    State(state): State<AppState>,
+) -> ApiResult<Response> {
+    build_contract_abi_response(headers, Path(id), Query(query), State(state)).await
+}
+
+async fn build_contract_abi_response(
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ContractAbiQuery>,
+    State(state): State<AppState>,
+) -> ApiResult<Response> {
+    let format = query.format.as_deref().unwrap_or("v1");
+    if !matches!(format, "v1" | "v2") {
+        return Err(ApiError::bad_request(
+            "InvalidAbiFormat",
+            "format must be v1 or v2",
+        ));
+    }
+
+    let cache_key = format!(
+        "abi-response:{}:{}:{}",
+        id,
+        query.version.as_deref().unwrap_or("latest"),
+        format
+    );
+    let body = if let Some(cached) = state
+        .cache
+        .get_abi(&cache_key, query.bypass_cache.unwrap_or(false))
+        .await
+    {
+        cached
+    } else {
+        let row = fetch_contract_abi_row(&state, &id, query.version.as_deref()).await?;
+        let envelope = contract_abi_envelope(&row, format)?;
+        let encoded = serde_json::to_string(&envelope)
+            .map_err(|e| ApiError::internal(format!("serialize ABI response: {}", e)))?;
+        state.cache.put_abi(&cache_key, encoded.clone()).await;
+        encoded
+    };
+
+    let hash = abi_hash(&body);
+    let accepts_gzip = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').any(|part| part.trim().starts_with("gzip")))
+        .unwrap_or(false);
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .header("X-ABI-Hash", hash);
+
+    if accepts_gzip {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(body.as_bytes())
+            .map_err(|_| ApiError::internal("Failed to compress ABI response"))?;
+        let compressed = encoder
+            .finish()
+            .map_err(|_| ApiError::internal("Failed to finalize ABI compression"))?;
+        builder = builder.header(header::CONTENT_ENCODING, "gzip");
+        return builder
+            .body(Body::from(compressed))
+            .map_err(|_| ApiError::internal("Failed to build ABI response"));
+    }
+
+    builder
+        .body(Body::from(body))
+        .map_err(|_| ApiError::internal("Failed to build ABI response"))
+}
+
+async fn fetch_contract_abi_row(
+    state: &AppState,
+    id: &str,
+    version: Option<&str>,
+) -> ApiResult<ContractAbiRow> {
+    let contract_uuid = fetch_contract_identity(state, id).await?.0;
+
+    if let Some(version) = version {
+        return sqlx::query_as::<_, ContractAbiRow>(
+            "SELECT c.id AS contract_uuid,
+                    c.contract_id,
+                    ca.version,
+                    ca.abi,
+                    v.compiler_version AS compiler,
+                    ca.created_at AS generated_at
+             FROM contracts c
+             JOIN contract_abis ca ON ca.contract_id = c.id
+             LEFT JOIN verifications v ON v.contract_id = c.id
+             WHERE c.id = $1 AND ca.version = $2
+             ORDER BY v.verified_at DESC NULLS LAST
+             LIMIT 1",
+        )
+        .bind(contract_uuid)
+        .bind(version)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| db_internal_error("fetch contract ABI version", err))?
+        .ok_or_else(|| ApiError::not_found("AbiNotFound", "ABI version not found"));
+    }
+
+    if let Some(row) = sqlx::query_as::<_, ContractAbiRow>(
+        "SELECT c.id AS contract_uuid,
+                c.contract_id,
+                ca.version,
+                ca.abi,
+                v.compiler_version AS compiler,
+                ca.created_at AS generated_at
+         FROM contracts c
+         JOIN contract_abis ca ON ca.contract_id = c.id
+         LEFT JOIN verifications v ON v.contract_id = c.id
+         WHERE c.id = $1
+         ORDER BY ca.created_at DESC, v.verified_at DESC NULLS LAST
+         LIMIT 1",
+    )
+    .bind(contract_uuid)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch latest contract ABI", err))?
+    {
+        return Ok(row);
+    }
+
+    sqlx::query_as::<_, ContractAbiRow>(
+        "SELECT c.id AS contract_uuid,
+                c.contract_id,
+                NULL::VARCHAR AS version,
+                c.abi,
+                v.compiler_version AS compiler,
+                c.updated_at AS generated_at
+         FROM contracts c
+         LEFT JOIN verifications v ON v.contract_id = c.id
+         WHERE c.id = $1 AND c.abi IS NOT NULL
+         ORDER BY v.verified_at DESC NULLS LAST
+         LIMIT 1",
+    )
+    .bind(contract_uuid)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch fallback contract ABI", err))?
+    .ok_or_else(|| ApiError::not_found("AbiNotFound", "No ABI found for contract"))
+}
+
+fn contract_abi_envelope(row: &ContractAbiRow, format: &str) -> ApiResult<Value> {
+    let metadata = json!({
+        "contract_uuid": row.contract_uuid,
+        "contract_id": row.contract_id,
+        "version": row.version.as_deref().unwrap_or("latest"),
+        "compiler": row.compiler.as_deref().unwrap_or("unknown"),
+        "generated_at": row.generated_at,
+        "format": format,
+    });
+
+    match format {
+        "v1" => Ok(json!({
+            "metadata": metadata,
+            "abi": row.abi,
+        })),
+        "v2" => {
+            let mut envelope = BTreeMap::new();
+            envelope.insert("metadata", metadata);
+            envelope.insert("spec", row.abi.clone());
+            Ok(json!(envelope))
+        }
+        _ => Err(ApiError::bad_request(
+            "InvalidAbiFormat",
+            "format must be v1 or v2",
+        )),
+    }
+}
+
+fn abi_hash(body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[utoipa::path(
@@ -4866,14 +5564,13 @@ pub async fn update_contract_metadata(
     .await?;
 
     // Fetch before tags for audit log
-    let before_tag_rows = sqlx::query!(
+    let before_tag_names: Vec<String> = sqlx::query_scalar::<_, String>(
         "SELECT t.name FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
-        before.id
     )
+    .bind(before.id)
     .fetch_all(&state.db)
     .await
     .map_err(|err| db_internal_error("fetch before tags", err))?;
-    let before_tag_names: Vec<String> = before_tag_rows.into_iter().map(|r| r.name).collect();
 
     let mut tx = state
         .db
@@ -4933,10 +5630,16 @@ pub async fn update_contract_metadata(
         after.tags = new_tags;
     } else {
         // Fetch existing tags for after response
-        let after_tag_rows = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct TagRow {
+            id: Uuid,
+            name: String,
+            color: String,
+        }
+        let after_tag_rows = sqlx::query_as::<_, TagRow>(
             "SELECT t.id, t.name, t.color FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
-            after.id
         )
+        .bind(after.id)
         .fetch_all(&mut *tx)
         .await
         .map_err(|err| db_internal_error("fetch after tags", err))?;
@@ -5014,6 +5717,24 @@ pub async fn update_contract_metadata(
     }
 
     state.cache.invalidate_contracts().await;
+    state.cache.invalidate_contract_meta(&after.contract_id).await;
+    state.cache.invalidate_contract_meta(&after.id.to_string()).await;
+
+    // Increment usage counter asynchronously (fire-and-forget)
+    // Failures are logged but never block the main request
+    let contract_id = after.id;
+    let db_clone = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::usage_counter::increment_usage_counter_with_timeout(contract_id, &db_clone).await
+        {
+            tracing::warn!(
+                contract_id = %contract_id,
+                error = ?err,
+                "Failed to increment usage counter for contract"
+            );
+        }
+    });
     Ok(Json(after))
 }
 
@@ -5297,6 +6018,22 @@ pub async fn update_contract_status(
     }
 
     state.cache.invalidate_contracts().await;
+
+    // Increment usage counter asynchronously (fire-and-forget)
+    // Failures are logged but never block the main request
+    let db_clone = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::usage_counter::increment_usage_counter_with_timeout(contract_uuid, &db_clone)
+                .await
+        {
+            tracing::warn!(
+                contract_id = %contract_uuid,
+                error = ?err,
+                "Failed to increment usage counter for contract"
+            );
+        }
+    });
     Ok(Json(json!({
         "contract_id": contract_uuid,
         "verification_id": verification_id,
@@ -5409,6 +6146,295 @@ pub async fn bulk_update_contract_status(
 
     state.cache.invalidate_contracts().await;
     Ok(Json(json!({ "results": results })))
+}
+
+/// Batch metadata update — apply name/description/category/tag changes to multiple contracts (#849).
+/// Each item is processed in its own transaction so a per-item failure never rolls back prior items.
+/// A version snapshot is written to `contract_metadata_versions` before each update, enabling
+/// per-contract rollback via `POST /api/contracts/:id/metadata/rollback/:version_id`.
+pub async fn batch_update_contract_metadata(
+    State(state): State<AppState>,
+    ValidatedJson(req): ValidatedJson<shared::BatchMetadataUpdateRequest>,
+) -> ApiResult<Json<shared::BatchMetadataUpdateResponse>> {
+    let batch_id = req
+        .batch_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let user_id = req.user_id;
+
+    let mut results: Vec<shared::BatchMetadataUpdateItemResult> = Vec::new();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+
+    for item in req.items {
+        // Require at least one metadata field per item.
+        if item.name.is_none()
+            && item.description.is_none()
+            && item.category.is_none()
+            && item.tags.is_none()
+        {
+            results.push(shared::BatchMetadataUpdateItemResult {
+                contract_id: item.contract_id,
+                ok: false,
+                rollback_version_id: None,
+                error: Some("at_least_one_field_required".to_string()),
+            });
+            failed += 1;
+            continue;
+        }
+
+        let contract_uuid = match Uuid::parse_str(&item.contract_id) {
+            Ok(id) => id,
+            Err(_) => {
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: None,
+                    error: Some("invalid_contract_id".to_string()),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Fetch current contract for before-state.
+        let before: Contract = match sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+            .bind(contract_uuid)
+            .fetch_one(&state.db)
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => {
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: None,
+                    error: Some("not_found".to_string()),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Fetch current tag names for the snapshot.
+        let before_tag_names: Vec<String> = match sqlx::query_scalar::<_, String>(
+            "SELECT t.name FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
+        )
+        .bind(contract_uuid)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(names) => names,
+            Err(e) => {
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: None,
+                    error: Some(format!("fetch_tags_failed: {}", e)),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Per-item transaction.
+        let mut tx = match state.db.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: None,
+                    error: Some(format!("begin_tx_failed: {}", e)),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Snapshot current metadata so callers can rollback to this version.
+        let snapshot_summary = item
+            .change_summary
+            .as_deref()
+            .map(|s| format!("Before batch update: {}", s));
+        let rollback_version_id: Uuid = match sqlx::query_scalar(
+            "INSERT INTO contract_metadata_versions
+                 (contract_id, user_id, name, description, category, tags, change_summary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id",
+        )
+        .bind(contract_uuid)
+        .bind(user_id)
+        .bind(&before.name)
+        .bind(&before.description)
+        .bind(&before.category)
+        .bind(&before_tag_names)
+        .bind(snapshot_summary)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: None,
+                    error: Some(format!("snapshot_failed: {}", e)),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Apply COALESCE UPDATE.
+        let mut after: Contract = match sqlx::query_as(
+            "UPDATE contracts
+             SET name        = COALESCE($2, name),
+                 description = COALESCE($3, description),
+                 category    = COALESCE($4, category),
+                 updated_at  = NOW()
+             WHERE id = $1
+             RETURNING *",
+        )
+        .bind(contract_uuid)
+        .bind(item.name.as_deref())
+        .bind(item.description.as_deref())
+        .bind(item.category.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: Some(rollback_version_id),
+                    error: Some(format!("update_failed: {}", e)),
+                });
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Sync tags when the caller supplied a tag list.
+        let mut after_tag_names = before_tag_names.clone();
+        if let Some(tag_names) = &item.tags {
+            after_tag_names = tag_names.clone();
+
+            if let Err(e) = sqlx::query("DELETE FROM contract_tags WHERE contract_id = $1")
+                .bind(contract_uuid)
+                .execute(&mut *tx)
+                .await
+            {
+                let _ = tx.rollback().await;
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: Some(rollback_version_id),
+                    error: Some(format!("delete_tags_failed: {}", e)),
+                });
+                failed += 1;
+                continue;
+            }
+
+            let mut new_tags: Vec<shared::Tag> = Vec::new();
+            let mut tag_error: Option<String> = None;
+            for tag_name in tag_names {
+                let tag: Result<shared::Tag, _> = sqlx::query_as(
+                    "INSERT INTO tags (name) VALUES ($1)
+                     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                     RETURNING id, name, color",
+                )
+                .bind(tag_name)
+                .fetch_one(&mut *tx)
+                .await;
+
+                match tag {
+                    Ok(t) => {
+                        let link = sqlx::query(
+                            "INSERT INTO contract_tags (contract_id, tag_id)
+                             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        )
+                        .bind(contract_uuid)
+                        .bind(t.id)
+                        .execute(&mut *tx)
+                        .await;
+                        if let Err(e) = link {
+                            tag_error = Some(format!("link_tag_failed: {}", e));
+                            break;
+                        }
+                        new_tags.push(t);
+                    }
+                    Err(e) => {
+                        tag_error = Some(format!("upsert_tag_failed: {}", e));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = tag_error {
+                let _ = tx.rollback().await;
+                results.push(shared::BatchMetadataUpdateItemResult {
+                    contract_id: item.contract_id,
+                    ok: false,
+                    rollback_version_id: Some(rollback_version_id),
+                    error: Some(err),
+                });
+                failed += 1;
+                continue;
+            }
+            after.tags = new_tags;
+        }
+
+        // Commit this item.
+        if let Err(e) = tx.commit().await {
+            results.push(shared::BatchMetadataUpdateItemResult {
+                contract_id: item.contract_id,
+                ok: false,
+                rollback_version_id: Some(rollback_version_id),
+                error: Some(format!("commit_failed: {}", e)),
+            });
+            failed += 1;
+            continue;
+        }
+
+        // Audit log (best-effort, after commit).
+        let changes = json!({
+            "name":        { "before": before.name,        "after": after.name },
+            "description": { "before": before.description, "after": after.description },
+            "category":    { "before": before.category,    "after": after.category },
+            "tags":        { "before": before_tag_names,   "after": after_tag_names },
+            "batch_id":    &batch_id,
+        });
+        let _ = write_contract_audit_log(
+            &state.db,
+            AuditActionType::MetadataUpdated,
+            contract_uuid,
+            user_id.unwrap_or(before.publisher_id),
+            changes,
+            "batch",
+        )
+        .await;
+
+        results.push(shared::BatchMetadataUpdateItemResult {
+            contract_id: item.contract_id,
+            ok: true,
+            rollback_version_id: Some(rollback_version_id),
+            error: None,
+        });
+        succeeded += 1;
+    }
+
+    state.cache.invalidate_contracts().await;
+
+    Ok(Json(shared::BatchMetadataUpdateResponse {
+        batch_id,
+        total: results.len(),
+        succeeded,
+        failed,
+        results,
+    }))
 }
 
 #[utoipa::path(
@@ -5541,13 +6567,7 @@ pub async fn get_contract_deployments(
                 .await
                 .map_err(|err| db_internal_error("get logical_id", err))?;
 
-        ensure_contract_exists(
-            &state,
-            contract_uuid,
-            &id,
-            "get contract for list deployments",
-        )
-        .await?;
+        ensure_contract_exists(&state, uuid, &id, "get contract for list deployments").await?;
         if let Some(lid) = logical_id {
             sqlx::query_scalar("SELECT id FROM contracts WHERE logical_id = $1")
                 .bind(lid)
@@ -5623,14 +6643,6 @@ pub async fn get_contract_deployments(
     );
     query_builder.push_bind(&target_uuids);
     query_builder.push(") AND ci.interaction_type = cast('deploy' as text)");
-
-    let deployments: Vec<ContractDeployment> = sqlx::query_as(
-        "SELECT * FROM contract_deployments WHERE contract_id = $1 ORDER BY deployed_at DESC",
-    )
-    .bind(contract_uuid)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| db_internal_error("get contract deployments", err))?;
 
     query_builder.push(" ORDER BY ci.created_at DESC");
     query_builder.push(" LIMIT ");
@@ -6106,6 +7118,59 @@ pub async fn route_not_found() -> impl IntoResponse {
     ApiError::not_found("ROUTE_NOT_FOUND", "Route not found")
 }
 
+/// Get usage statistics for a specific contract by UUID or slug.
+#[utoipa::path(
+    get,
+    path = "/api/contracts/{id}/stats",
+    params(
+        ("id" = String, Path, description = "Contract UUID or slug")
+    ),
+    responses(
+        (status = 200, description = "Contract usage statistics", body = ContractStatsResponse),
+        (status = 404, description = "Contract not found"),
+        (status = 400, description = "Invalid contract ID format")
+    ),
+    tag = "Analytics"
+)]
+pub async fn get_contract_stats(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ContractStatsResponse>> {
+    let contract: Contract = if let Ok(contract_uuid) = Uuid::parse_str(&id) {
+        sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+            .bind(contract_uuid)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| match err {
+                sqlx::Error::RowNotFound => ApiError::not_found(
+                    "ContractNotFound",
+                    format!("No contract found with ID: {}", id),
+                ),
+                _ => db_internal_error("get contract stats by id", err),
+            })?
+    } else {
+        // Fetch by slug (default to mainnet)
+        sqlx::query_as("SELECT * FROM contracts WHERE slug = $1 AND network = $2")
+            .bind(&id)
+            .bind(Network::Mainnet)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| match err {
+                sqlx::Error::RowNotFound => ApiError::not_found(
+                    "ContractNotFound",
+                    format!("No contract found with slug: {}", id),
+                ),
+                _ => db_internal_error("get contract stats by slug", err),
+            })?
+    };
+
+    Ok(Json(ContractStatsResponse {
+        contract_id: contract.id,
+        usage_count: contract.usage_count,
+        last_accessed_at: contract.last_accessed_at,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6130,9 +7195,19 @@ mod tests {
             .unwrap();
         let registry = Registry::new();
         let (job_engine, _rx) = soroban_batch::engine::JobEngine::new();
-        let state = AppState::new(db, registry, Arc::new(job_engine), is_shutting_down)
-            .await
-            .unwrap();
+        let rate_limit_state = Arc::new(crate::rate_limit::RateLimitState::from_env());
+        let (event_broadcaster, _event_rx) = tokio::sync::broadcast::channel(1);
+        let state = AppState::new(
+            db,
+            registry,
+            Arc::new(job_engine),
+            is_shutting_down,
+            rate_limit_state,
+            None,
+            event_broadcaster,
+        )
+        .await
+        .unwrap();
 
         let (status, json) = health_check(State(state)).await;
 
@@ -6186,15 +7261,20 @@ mod tests {
             contract_id: "C123".to_string(),
             wasm_hash: "hash".to_string(),
             name: "Demo".to_string(),
+            slug: "demo".to_string(),
             description: None,
             publisher_id: Uuid::nil(),
             network: Network::Testnet,
             is_verified: true,
+            verification_status: shared::VerificationStatus::Verified,
             category: None,
             tags: Vec::new(),
             created_at: now,
             updated_at: now + chrono::TimeDelta::seconds(10),
             verified_at: Some(now + chrono::TimeDelta::seconds(20)),
+            deployed_at: None,
+            verified_by: None,
+            verification_notes: None,
             last_accessed_at: Some(now + chrono::TimeDelta::seconds(30)),
             health_score: 0,
             is_maintenance: false,
@@ -6204,6 +7284,7 @@ mod tests {
             relevance_score: None,
             visibility: shared::VisibilityType::Public,
             current_version: None,
+            usage_count: 0,
         };
 
         assert_eq!(
@@ -6286,7 +7367,18 @@ mod tests {
             network: "testnet".to_string(),
             is_verified: true,
             category: Some("DeFi".to_string()),
-            tags: vec!["yield".to_string(), "automation".to_string()],
+            tags: vec![
+                shared::Tag {
+                    id: Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap(),
+                    name: "yield".to_string(),
+                    color: "#888888".to_string(),
+                },
+                shared::Tag {
+                    id: Uuid::parse_str("55555555-5555-5555-5555-555555555555").unwrap(),
+                    name: "automation".to_string(),
+                    color: "#888888".to_string(),
+                },
+            ],
             maturity: Some("stable".to_string()),
             health_score: 92,
             is_maintenance: false,
@@ -6584,26 +7676,36 @@ pub async fn advanced_search_contracts(
     // Fetch tags for these contracts (keeps output consistent with list_contracts)
     let contract_ids: Vec<Uuid> = contracts.iter().map(|c| c.id).collect();
     if !contract_ids.is_empty() {
-        let tag_rows = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct TagRow {
+            contract_id: Uuid,
+            id: Uuid,
+            name: String,
+            color: String,
+        }
+        let tag_rows = sqlx::query_as::<_, TagRow>(
             r#"
             SELECT ct.contract_id, t.id, t.name, t.color
             FROM tags t
             JOIN contract_tags ct ON t.id = ct.tag_id
             WHERE ct.contract_id = ANY($1)
             "#,
-            &contract_ids
         )
+        .bind(&contract_ids)
         .fetch_all(&state.db)
         .await
         .map_err(|err| db_internal_error("fetch tags (advanced search)", err))?;
 
         let mut tags_map: HashMap<Uuid, Vec<shared::Tag>> = HashMap::new();
         for row in tag_rows {
-            tags_map.entry(row.contract_id).or_default().push(shared::Tag {
-                id: row.id,
-                name: row.name,
-                color: row.color,
-            });
+            tags_map
+                .entry(row.contract_id)
+                .or_default()
+                .push(shared::Tag {
+                    id: row.id,
+                    name: row.name,
+                    color: row.color,
+                });
         }
 
         for contract in &mut contracts {
@@ -6686,7 +7788,7 @@ fn apply_condition<'a>(
         "publisher" => "c.publisher_id",
         "tag" => "t.name",
         _ => {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::bad_request_with(
                 "InvalidField",
                 format!("Field '{}' is not searchable", cond.field),
             ))
@@ -6695,7 +7797,7 @@ fn apply_condition<'a>(
 
     let string_value = || {
         cond.value.as_str().ok_or_else(|| {
-            ApiError::bad_request(
+            ApiError::bad_request_with(
                 "InvalidValue",
                 format!(
                     "Field '{}' expects a string value for operator '{:?}'",
@@ -6711,7 +7813,7 @@ fn apply_condition<'a>(
             builder.push(" = ");
             if cond.field == "verified" {
                 let value = cond.value.as_bool().ok_or_else(|| {
-                    ApiError::bad_request(
+                    ApiError::bad_request_with(
                         "InvalidValue",
                         "Field 'verified' expects a boolean value",
                     )
@@ -6725,7 +7827,7 @@ fn apply_condition<'a>(
             builder.push(" != ");
             if cond.field == "verified" {
                 let value = cond.value.as_bool().ok_or_else(|| {
-                    ApiError::bad_request(
+                    ApiError::bad_request_with(
                         "InvalidValue",
                         "Field 'verified' expects a boolean value",
                     )
@@ -6746,9 +7848,12 @@ fn apply_condition<'a>(
         FieldOperator::In => {
             builder.push(" IN (");
             let arr = cond.value.as_array().ok_or_else(|| {
-                ApiError::bad_request(
+                ApiError::bad_request_with(
                     "InvalidValue",
-                    format!("Field '{}' expects an array value for operator 'in'", cond.field),
+                    format!(
+                        "Field '{}' expects an array value for operator 'in'",
+                        cond.field
+                    ),
                 )
             })?;
 
@@ -6756,7 +7861,7 @@ fn apply_condition<'a>(
             for val in arr {
                 if cond.field == "verified" {
                     let b = val.as_bool().ok_or_else(|| {
-                        ApiError::bad_request(
+                        ApiError::bad_request_with(
                             "InvalidValue",
                             "Field 'verified' expects a boolean array value",
                         )
@@ -6764,7 +7869,7 @@ fn apply_condition<'a>(
                     separated.push_bind(b);
                 } else {
                     let s = val.as_str().ok_or_else(|| {
-                        ApiError::bad_request(
+                        ApiError::bad_request_with(
                             "InvalidValue",
                             format!("Field '{}' expects a string array value", cond.field),
                         )
@@ -6826,7 +7931,7 @@ pub async fn list_favorite_searches(
 )]
 pub async fn save_favorite_search(
     State(state): State<AppState>,
-    Json(req): Json<SaveFavoriteSearchRequest>,
+    ValidatedJson(req): ValidatedJson<SaveFavoriteSearchRequest>,
 ) -> ApiResult<Json<FavoriteSearch>> {
     let favorite: FavoriteSearch = sqlx::query_as(
         "INSERT INTO favorite_searches (name, query_json) VALUES ($1, $2) RETURNING *",
@@ -6867,11 +7972,52 @@ pub async fn delete_favorite_search(
         .map_err(|err| db_internal_error("delete favorite search", err))?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::not_found(
-            "FavoriteNotFound",
+        return Err(ApiError::not_found(            "FavoriteNotFound",
             "Favorite search not found",
         ));
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// Axum Handler to Export Logs using project native structs
+pub async fn handle_export_audit(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<crate::audit::AuditRow>>> {
+    let logs = sqlx::query_as::<_, crate::audit::AuditRow>(
+        r#"
+        SELECT id, actor_id, actor_email, operation, resource_type,
+               resource_id, metadata, status, error_message, chain_hash,
+               created_at
+        FROM audit_logs
+        ORDER BY created_at DESC
+        "#
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "DatabaseError",
+        format!("Failed to export audit logs: {e}")
+    ))?;
+
+    Ok(Json(logs))
+}
+
+// Axum Handler to enforce retention criteria
+pub async fn handle_retention_cleanup(
+    State(state): State<AppState>,
+) -> ApiResult<String> {
+    let result = sqlx::query(
+        "DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '1 year'"
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "DatabaseError",
+        format!("Failed to prune logs: {e}")
+    ))?;
+    
+    Ok(format!("Pruned rows: {}", result.rows_affected()))
 }

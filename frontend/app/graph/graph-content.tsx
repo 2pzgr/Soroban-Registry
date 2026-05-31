@@ -8,7 +8,6 @@ import { useState, useCallback, useRef, useMemo, useEffect } from 'react';
 import { AlertCircle, Sparkles, ExternalLink, X } from 'lucide-react';
 import { useAnalytics } from '@/hooks/useAnalytics';
 import type { DependencyGraphHandle } from '@/components/DependencyGraph';
-import { useRouter } from 'next/navigation';
 import { useTranslation } from '@/lib/i18n/client';
 
 // Generate synthetic demo data for testing at scale
@@ -40,7 +39,6 @@ function generateDemoData(nodeCount: number): { nodes: GraphNode[]; edges: Graph
         });
     }
 
-    // Create edges — power-law distribution: some nodes get many dependents
     const edges: GraphEdge[] = [];
     const edgeCount = Math.min(nodeCount * 2, nodeCount * (nodeCount - 1) / 2);
     const edgeSet = new Set<string>();
@@ -64,13 +62,11 @@ function generateDemoData(nodeCount: number): { nodes: GraphNode[]; edges: Graph
     };
 
     for (let i = 0; i < edgeCount; i++) {
-        // Bias towards lower-index nodes as targets to create hub nodes
         const sourceIdx = Math.floor(Math.random() * nodeCount);
         const targetIdx = Math.floor(Math.pow(Math.random(), 2) * nodeCount);
         pushEdge(sourceIdx, targetIdx);
     }
 
-    // Inject a few explicit cycles to exercise cycle highlighting.
     const cycleGroups = Math.min(8, Math.floor(nodeCount / 10));
     for (let i = 0; i < cycleGroups; i++) {
         const a = i * 3;
@@ -101,15 +97,16 @@ export function GraphContent() {
     const [explorationEdges, setExplorationEdges] = useState<GraphEdge[]>([]);
     const [searchMatchIndex, setSearchMatchIndex] = useState(0);
     const graphRef = useRef<DependencyGraphHandle | null>(null);
-    const router = useRouter();
     const { logEvent } = useAnalytics();
 
     // Reset exploration state when mode is toggled off
     useEffect(() => {
         if (!explorationMode) {
-            setExplorationNodes([]);
-            setExplorationEdges([]);
-            setExpandedNodeIds(new Set());
+            requestAnimationFrame(() => {
+                setExplorationNodes([]);
+                setExplorationEdges([]);
+                setExpandedNodeIds(new Set());
+            });
         }
     }, [explorationMode]);
 
@@ -162,7 +159,6 @@ export function GraphContent() {
         [demoMode, demoNodeCount]
     );
 
-    // Apply client-side network filtering for demo mode
     const filteredDemoData = useMemo(() => {
         if (!demoData || !networkFilter) return demoData;
         const filteredNodes = demoData.nodes.filter((n) => n.network === networkFilter);
@@ -175,7 +171,6 @@ export function GraphContent() {
 
     const graphData = demoMode ? filteredDemoData : apiData;
 
-    // Safe nodes/edges (API may return missing or non-array values)
     const rawNodes = useMemo(
         () => (graphData && Array.isArray(graphData.nodes) ? graphData.nodes : []),
         [graphData]
@@ -214,7 +209,6 @@ export function GraphContent() {
     const nodes = filteredGraph.nodes;
     const edges = filteredGraph.edges;
 
-    // Compute dependent counts (how many nodes depend on this one = in-edges)
     const dependentCounts = useMemo(() => {
         const counts = new Map<string, number>();
         for (const edge of edges) {
@@ -223,7 +217,6 @@ export function GraphContent() {
         return counts;
     }, [edges]);
 
-    // Compute dependency counts (how many nodes this one depends on = out-edges)
     const dependencyCounts = useMemo(() => {
         const counts = new Map<string, number>();
         for (const edge of edges) {
@@ -238,14 +231,13 @@ export function GraphContent() {
         return count;
     }, [dependentCounts]);
 
-    // Per-network node counts for the stats panel
     const networkCounts = useMemo(() => {
         const counts = { mainnet: 0, testnet: 0, futurenet: 0, other: 0 };
         for (const node of nodes) {
-            const n = node.network?.toLowerCase() ?? "";
-            if (n === "mainnet") counts.mainnet++;
-            else if (n === "testnet") counts.testnet++;
-            else if (n === "futurenet") counts.futurenet++;
+            const n = node.network?.toLowerCase() ?? '';
+            if (n === 'mainnet') counts.mainnet++;
+            else if (n === 'testnet') counts.testnet++;
+            else if (n === 'futurenet') counts.futurenet++;
             else counts.other++;
         }
         return counts;
@@ -260,7 +252,7 @@ export function GraphContent() {
             logEvent('node_selected', {
                 contract_id: node.contract_id,
                 name: node.name,
-                source: 'graph_page'
+                source: 'graph_page',
             });
         }
     };
@@ -281,7 +273,6 @@ export function GraphContent() {
         logEvent('node_expanded', { node_id: id });
     };
 
-    // Search match navigation
     const searchMatches = useMemo(() => {
         if (!searchQuery || nodes.length === 0) return [];
         const q = searchQuery.toLowerCase();
@@ -290,12 +281,10 @@ export function GraphContent() {
             .map((n) => n.id);
     }, [searchQuery, nodes]);
 
-    // Reset match index when query or matches change
     useEffect(() => {
-        setSearchMatchIndex(0);
+        requestAnimationFrame(() => setSearchMatchIndex(0));
     }, [searchQuery]);
 
-    // Auto-focus on the active match
     useEffect(() => {
         if (searchMatches.length > 0 && graphRef.current) {
             graphRef.current.focusOnNode(searchMatches[searchMatchIndex] || searchMatches[0]);
@@ -318,7 +307,6 @@ export function GraphContent() {
     // Keyboard shortcuts
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
-            // Ignore when typing in inputs
             if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
             const g = graphRef.current;
             if (!g) return;
@@ -449,64 +437,62 @@ export function GraphContent() {
                 onPanLeft={() => graphRef.current?.panLeft()}
                 onPanRight={() => graphRef.current?.panRight()}
                 networkCounts={networkCounts}
-            />            {/* Selected Node Panel */}
-            {selectedNode && (() => {
-                const node = selectedNode;
-                return (
-                    <div className="absolute bottom-4 left-4 z-30 w-80 bg-card/90 backdrop-blur-xl border border-border rounded-xl shadow-lg overflow-hidden">
-                        {/* Header */}
-                        <div className="p-4 pb-3">
-                            <div className="flex items-start justify-between">
-                                <div className="flex-1 min-w-0 pr-2">
-                                    <h3 className="font-semibold text-foreground text-base truncate">{node.name}</h3>
-                                    <p className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">{node.contract_id}</p>
-                                </div>
-                                <button
-                                    onClick={() => setSelectedNode(null)}
-                                    className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-1 rounded hover:bg-accent focus-visible:ring-1 focus-visible:ring-primary focus:outline-none"
-                                    aria-label="Close panel"
-                                >
-                                    <X className="w-4 h-4" />
-                                </button>
-                            </div>
-                        </div>
+            />
 
-                        {/* Stats row */}
-                        <div className="grid grid-cols-3 gap-px bg-border">
-                            <div className="bg-card p-2.5 text-center">
-                                <div className="text-lg font-bold text-foreground">{dependentCounts.get(node.id) || 0}</div>
-                                <div className="text-[10px] text-muted-foreground">{t('graph.dependents')}</div>
+            {/* Selected Node Panel */}
+            {selectedNode && (
+                <div className="absolute bottom-4 left-4 z-30 w-80 bg-card/90 backdrop-blur-xl border border-border rounded-xl shadow-lg overflow-hidden">
+                    <div className="p-4 pb-3">
+                        <div className="flex items-start justify-between">
+                            <div className="flex-1 min-w-0 pr-2">
+                                <h3 className="font-semibold text-foreground text-base truncate">{selectedNode.name}</h3>
+                                <p className="text-[10px] text-muted-foreground font-mono truncate mt-0.5">{selectedNode.contract_id}</p>
                             </div>
-                            <div className="bg-card p-2.5 text-center">
-                                <div className="text-lg font-bold text-foreground">{dependencyCounts.get(node.id) || 0}</div>
-                                <div className="text-[10px] text-muted-foreground">{t('graph.dependencies')}</div>
-                            </div>
-                            <div className="bg-card p-2.5 text-center">
-                                <div className={`text-sm font-bold ${node.is_verified ? 'text-green-500' : 'text-muted-foreground'}`}>
-                                    {node.is_verified ? `✓ ${t('common.yes', 'Yes')}` : '—'}
-                                </div>
-                                <div className="text-[10px] text-muted-foreground">{t('graph.verified')}</div>
-                            </div>
+                            <button
+                                onClick={() => setSelectedNode(null)}
+                                className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-1 rounded hover:bg-accent focus-visible:ring-1 focus-visible:ring-primary focus:outline-none"
+                                aria-label="Close panel"
+                            >
+                                <X className="w-4 h-4" />
+                            </button>
                         </div>
+                    </div>
 
-                        {/* Details + Tags */}
-                        <div className="p-4 pt-3 space-y-3">
-                            <div className="space-y-1.5 text-sm">
+                    <div className="grid grid-cols-3 gap-px bg-border">
+                        <div className="bg-card p-2.5 text-center">
+                            <div className="text-lg font-bold text-foreground">{dependentCounts.get(selectedNode.id) || 0}</div>
+                            <div className="text-[10px] text-muted-foreground">{t('graph.dependents')}</div>
+                        </div>
+                        <div className="bg-card p-2.5 text-center">
+                            <div className="text-lg font-bold text-foreground">{dependencyCounts.get(selectedNode.id) || 0}</div>
+                            <div className="text-[10px] text-muted-foreground">{t('graph.dependencies')}</div>
+                        </div>
+                        <div className="bg-card p-2.5 text-center">
+                            <div className={`text-sm font-bold ${selectedNode.is_verified ? 'text-green-500' : 'text-muted-foreground'}`}>
+                                {selectedNode.is_verified ? `✓ ${t('common.yes', 'Yes')}` : '—'}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground">{t('graph.verified')}</div>
+                        </div>
+                    </div>
+
+                    <div className="p-4 pt-3 space-y-3">
+                        <div className="space-y-1.5 text-sm">
+                            <div className="flex justify-between">
+                                <span className="text-muted-foreground">{t('graph.network')}</span>
+                                <span className={`font-medium px-2 py-0.5 rounded-full text-xs ${
+                                    selectedNode.network === 'mainnet' ? 'text-green-600 bg-green-500/10' :
+                                    selectedNode.network === 'testnet' ? 'text-blue-600 bg-blue-500/10' :
+                                    'text-purple-600 bg-purple-500/10'
+                                }`}>{selectedNode.network}</span>
+                            </div>
+                            {selectedNode.category && (
                                 <div className="flex justify-between">
-                                    <span className="text-muted-foreground">{t('graph.network')}</span>
-                                    <span className={`font-medium px-2 py-0.5 rounded-full text-xs ${node.network === 'mainnet' ? 'text-green-600 bg-green-500/10' :
-                                        node.network === 'testnet' ? 'text-blue-600 bg-blue-500/10' : 'text-purple-600 bg-purple-500/10'
-                                        }`}>{node.network}</span>
+                                    <span className="text-muted-foreground">{t('graph.type')}</span>
+                                    <span className="text-foreground font-medium">{selectedNode.category}</span>
                                 </div>
-                                {node.category && (
-                                    <div className="flex justify-between">
-                                        <span className="text-muted-foreground">{t('graph.type')}</span>
-                                        <span className="text-foreground font-medium">{node.category}</span>
-                                    </div>
-                                )}
-                            </div>
+                            )}
+                        </div>
 
-                        {/* Link */}
                         <div className="grid grid-cols-2 gap-2 pt-2">
                             <button
                                 onClick={() => handleExpandNode(selectedNode.id)}
@@ -528,8 +514,8 @@ export function GraphContent() {
                             </a>
                         </div>
                     </div>
-                );
-            })()}
+                </div>
+            )}
 
             {/* Empty State */}
             {!demoMode && nodes.length === 0 && !isLoading && (

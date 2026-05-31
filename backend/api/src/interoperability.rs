@@ -5,15 +5,14 @@ use serde_json::Value;
 use shared::{
     ContractInteroperabilityResponse, GraphEdge, GraphNode, GraphResponse,
     InteroperabilityCapability, InteroperabilityCapabilityKind, InteroperabilityProtocolMatch,
-    InteroperabilitySuggestion, InteroperabilitySummary, Network, ProtocolComplianceStatus,
+    InteroperabilitySuggestion, InteroperabilitySummary, Network, ProtocolComplianceStatus, Tag,
 };
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::{
-    error::{ApiError, ApiResult},
-    type_safety::parser::parse_json_spec,
-};
+use crate::error::{ApiError, ApiResult};
+
+use contract_abi::parser::parse_json_spec;
 
 #[derive(Debug, Clone, FromRow)]
 struct ContractAnalysisRow {
@@ -115,7 +114,8 @@ pub async fn analyze_contract_interoperability(
     let target_is_bridge = has_capability(&capabilities, InteroperabilityCapabilityKind::Bridge);
     let target_is_adapter = has_capability(&capabilities, InteroperabilityCapabilityKind::Adapter);
 
-    let candidate_rows = load_candidate_contracts(pool, contract.id, contract.network).await?;
+    let candidate_rows =
+        load_candidate_contracts(pool, contract.id, contract.network.clone()).await?;
     let mut candidate_by_id = HashMap::new();
     let mut scored = Vec::new();
     for row in candidate_rows {
@@ -179,7 +179,7 @@ pub async fn analyze_contract_interoperability(
             contract_id: item.candidate.row.id,
             contract_address: item.candidate.row.contract_id.clone(),
             contract_name: item.candidate.row.name.clone(),
-            network: item.candidate.row.network,
+            network: item.candidate.row.network.clone(),
             category: item.candidate.row.category.clone(),
             is_verified: item.candidate.row.is_verified,
             score: item.score,
@@ -194,7 +194,7 @@ pub async fn analyze_contract_interoperability(
         contract_id: contract.id,
         contract_address: contract.contract_id,
         contract_name: contract.name,
-        network: contract.network,
+        network: contract.network.clone(),
         analyzed_at: Utc::now(),
         has_abi: contract.abi.is_some(),
         analyzed_functions: functions.into_iter().collect(),
@@ -524,20 +524,36 @@ fn supported_protocols(
 
 fn has_capability(
     capabilities: &[InteroperabilityCapability],
-    kind: InteroperabilityCapabilityKind,
+    target_kind: InteroperabilityCapabilityKind,
 ) -> bool {
     capabilities
         .iter()
-        .any(|capability| capability.kind == kind)
+        .any(|capability| match (&capability.kind, &target_kind) {
+            (InteroperabilityCapabilityKind::Bridge, InteroperabilityCapabilityKind::Bridge) => {
+                true
+            }
+            (InteroperabilityCapabilityKind::Adapter, InteroperabilityCapabilityKind::Adapter) => {
+                true
+            }
+            _ => false,
+        })
 }
 
 fn count_capabilities(
     capabilities: &[InteroperabilityCapability],
-    kind: InteroperabilityCapabilityKind,
+    target_kind: InteroperabilityCapabilityKind,
 ) -> usize {
     capabilities
         .iter()
-        .filter(|capability| capability.kind == kind)
+        .filter(|capability| match (&capability.kind, &target_kind) {
+            (InteroperabilityCapabilityKind::Bridge, InteroperabilityCapabilityKind::Bridge) => {
+                true
+            }
+            (InteroperabilityCapabilityKind::Adapter, InteroperabilityCapabilityKind::Adapter) => {
+                true
+            }
+            _ => false,
+        })
         .count()
 }
 fn score_candidate(
@@ -770,10 +786,18 @@ fn to_graph_node(contract: &ContractAnalysisRow) -> GraphNode {
         id: contract.id,
         contract_id: contract.contract_id.clone(),
         name: contract.name.clone(),
-        network: contract.network,
+        network: contract.network.clone(),
         is_verified: contract.is_verified,
         category: contract.category.clone(),
-        tags: contract.tags.clone(),
+        tags: contract
+            .tags
+            .iter()
+            .map(|tag| Tag {
+                id: Uuid::nil(),
+                name: tag.clone(),
+                color: String::new(),
+            })
+            .collect(),
     }
 }
 

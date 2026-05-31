@@ -5,6 +5,7 @@
 //   - Validates publisher identity (email ownership).
 //   - Returns verification status and badge metadata.
 
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -80,7 +81,7 @@ fn is_valid_email(email: &str) -> bool {
 /// Here we simulate a successful verification when the token is exactly
 /// `"verify-{email_hash}"` (first 8 hex chars of SHA256), or any non-empty
 /// token when the publisher's existing email already matches (auto-confirm).
-fn check_token(email: &str, token: Option<&str>) -> bool {
+fn check_token(_email: &str, token: Option<&str>) -> bool {
     match token {
         None => {
             // No token provided → treat as a first-step declarative submit.
@@ -111,7 +112,7 @@ fn check_token(email: &str, token: Option<&str>) -> bool {
 pub async fn verify_publisher(
     State(state): State<AppState>,
     Path(publisher_id): Path<Uuid>,
-    Json(body): Json<PublisherVerifyRequest>,
+    ValidatedJson(body): ValidatedJson<PublisherVerifyRequest>,
 ) -> ApiResult<(StatusCode, Json<PublisherVerifyResponse>)> {
     // 1. Validate email format.
     if !is_valid_email(&body.email) {
@@ -130,9 +131,7 @@ pub async fn verify_publisher(
     .await
     .map_err(|e| db_internal_error("fetch publisher for verification", e))?;
 
-    let row = row.ok_or_else(|| {
-        ApiError::not_found("PublisherNotFound", "Publisher not found")
-    })?;
+    let row = row.ok_or_else(|| ApiError::not_found("PublisherNotFound", "Publisher not found"))?;
 
     use sqlx::Row as _;
     let db_email: Option<String> = row.try_get("email").unwrap_or(None);
@@ -254,9 +253,7 @@ fn build_response(
         is_verified,
         verification_status: status,
         verified_at,
-        badge_url: format!(
-            "/api/publishers/{publisher_id}/badge.svg?status={badge_label}"
-        ),
+        badge_url: format!("/api/publishers/{publisher_id}/badge.svg?status={badge_label}"),
         message: message.to_string(),
     }
 }
@@ -318,13 +315,7 @@ mod tests {
     fn test_build_response_verified() {
         let now = Utc::now();
         let id = Uuid::new_v4();
-        let resp = build_response(
-            id,
-            true,
-            VerificationBadgeStatus::Verified,
-            Some(now),
-            "OK",
-        );
+        let resp = build_response(id, true, VerificationBadgeStatus::Verified, Some(now), "OK");
         assert!(resp.is_verified);
         assert_eq!(resp.verification_status, VerificationBadgeStatus::Verified);
         assert!(resp.badge_url.contains("verified"));
@@ -334,13 +325,7 @@ mod tests {
     #[test]
     fn test_build_response_pending() {
         let id = Uuid::new_v4();
-        let resp = build_response(
-            id,
-            false,
-            VerificationBadgeStatus::Pending,
-            None,
-            "sent",
-        );
+        let resp = build_response(id, false, VerificationBadgeStatus::Pending, None, "sent");
         assert!(!resp.is_verified);
         assert_eq!(resp.verification_status, VerificationBadgeStatus::Pending);
         assert!(resp.badge_url.contains("pending"));
@@ -365,13 +350,7 @@ mod tests {
     #[test]
     fn test_badge_url_contains_publisher_id() {
         let id = Uuid::new_v4();
-        let resp = build_response(
-            id,
-            true,
-            VerificationBadgeStatus::Verified,
-            None,
-            "",
-        );
+        let resp = build_response(id, true, VerificationBadgeStatus::Verified, None, "");
         assert!(resp.badge_url.contains(&id.to_string()));
     }
 }

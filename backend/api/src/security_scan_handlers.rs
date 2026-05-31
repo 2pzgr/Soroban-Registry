@@ -1,18 +1,20 @@
 // Security Scanning Handlers (#498)
 // Automated contract security scanning integration
 
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
     error::{ApiError, ApiResult},
+    ml_detector,
     state::AppState,
+    vulnerability_database,
 };
 use shared::{
     ContractSecuritySummary, CreateSecurityScannerRequest, IssueSeverity, IssueStatus,
@@ -35,7 +37,7 @@ pub struct ListScansQuery {
 pub async fn trigger_security_scan(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
-    Json(req): Json<TriggerSecurityScanRequest>,
+    ValidatedJson(req): ValidatedJson<TriggerSecurityScanRequest>,
 ) -> ApiResult<Json<SecurityScan>> {
     // Verify contract exists
     let contract_exists: bool =
@@ -49,7 +51,7 @@ pub async fn trigger_security_scan(
         return Err(ApiError::not_found("contract", "Contract not found"));
     }
 
-    // Get contract version if specified
+    // Get contract version if specified, otherwise fall back to the latest version.
     let contract_version_id = if let Some(version) = &req.version {
         let version_id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM contract_versions WHERE contract_id = $1 AND version = $2",
@@ -62,8 +64,67 @@ pub async fn trigger_security_scan(
 
         version_id
     } else {
-        None
+        sqlx::query_scalar(
+            "SELECT id FROM contract_versions WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(contract_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
     };
+
+    let requested_scan_type = req.scan_type.as_deref().unwrap_or("full");
+    let ml_scanner_requested = if requested_scan_type.eq_ignore_ascii_case("ml") {
+        true
+    } else if let Some(scanner_ids) = req.scanner_ids.as_ref() {
+        if scanner_ids.is_empty() {
+            false
+        } else {
+            let ml_scanner_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM security_scanners WHERE id = ANY($1) AND scanner_type = 'ml_local' AND is_active = true",
+            )
+            .bind(scanner_ids)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+            ml_scanner_count > 0
+        }
+    } else {
+        false
+    };
+
+    if ml_scanner_requested {
+        let contract_version_id = contract_version_id.ok_or_else(|| {
+            ApiError::not_found(
+                "contract_version",
+                "ML scans require a contract version with verified source code",
+            )
+        })?;
+
+        let (source_code, _verification_id) =
+            ml_detector::source_for_contract(&state, contract_id, req.version.as_deref()).await?;
+
+        let scan =
+            ml_detector::persist_ml_scan(&state, contract_id, contract_version_id, source_code)
+                .await?;
+
+        return Ok(Json(scan));
+    }
+
+    if let Ok((source_code, _verification_id)) =
+        ml_detector::source_for_contract(&state, contract_id, req.version.as_deref()).await
+    {
+        let scan = persist_pattern_scan(
+            &state,
+            contract_id,
+            contract_version_id,
+            source_code,
+            requested_scan_type,
+            "manual",
+        )
+        .await?;
+        return Ok(Json(scan));
+    }
 
     // Create scan record
     let scan = sqlx::query_as::<_, SecurityScan>(
@@ -158,13 +219,12 @@ pub async fn get_contract_security_summary(
     Path(contract_id): Path<Uuid>,
 ) -> ApiResult<Json<ContractSecuritySummary>> {
     // Get contract name
-    let contract_name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM contracts WHERE id = $1")
-            .bind(contract_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
-            .ok_or_else(|| ApiError::not_found("contract", "Contract not found"))?;
+    let contract_name = sqlx::query_scalar("SELECT name FROM contracts WHERE id = $1")
+        .bind(contract_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::not_found("contract", "Contract not found"))?;
 
     // Get latest scan
     let latest_scan: Option<SecurityScanSummary> = sqlx::query_as(
@@ -297,20 +357,21 @@ pub struct ListIssuesQuery {
 pub async fn update_security_issue(
     State(state): State<AppState>,
     Path((contract_id, issue_id)): Path<(Uuid, Uuid)>,
-    Json(req): Json<UpdateSecurityIssueRequest>,
+    ValidatedJson(req): ValidatedJson<UpdateSecurityIssueRequest>,
 ) -> ApiResult<Json<shared::SecurityIssue>> {
     // Verify issue belongs to contract
-    let existing: Option<(shared::SecurityIssue, Option<IssueStatus>)> = sqlx::query_as(
-        "SELECT *, NULL::issue_status_type as \"_\" FROM security_issues WHERE id = $1 AND contract_id = $2",
-    )
-    .bind(issue_id)
-    .bind(contract_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+    let existing: Option<shared::SecurityIssue> =
+        sqlx::query_as("SELECT * FROM security_issues WHERE id = $1 AND contract_id = $2")
+            .bind(issue_id)
+            .bind(contract_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
-    let (mut issue, _old_status) = existing
+    let mut issue = existing
         .ok_or_else(|| ApiError::not_found("security_issue", "Security issue not found"))?;
+
+    let _old_status = issue.status;
 
     // Update issue status
     issue = sqlx::query_as::<_, shared::SecurityIssue>(
@@ -329,7 +390,7 @@ pub async fn update_security_issue(
     .map_err(|e| ApiError::internal(format!("Failed to update issue: {}", e)))?;
 
     // Log the action
-    if let Some(_old) = _old_status {
+    if _old_status != req.status {
         let _ = sqlx::query(
             r#"
             INSERT INTO security_issue_actions
@@ -338,7 +399,7 @@ pub async fn update_security_issue(
             "#,
         )
         .bind(issue_id)
-        .bind(_old)
+        .bind(_old_status)
         .bind(&req.status)
         .bind(&req.notes)
         .execute(&state.db)
@@ -369,7 +430,7 @@ pub async fn list_security_scanners(
 /// POST /api/security/scanners
 pub async fn create_security_scanner(
     State(state): State<AppState>,
-    Json(req): Json<CreateSecurityScannerRequest>,
+    ValidatedJson(req): ValidatedJson<CreateSecurityScannerRequest>,
 ) -> ApiResult<Json<SecurityScanner>> {
     // In production, api_key should be encrypted before storage
     let scanner = sqlx::query_as::<_, SecurityScanner>(
@@ -423,6 +484,21 @@ pub async fn auto_scan_contract(
     contract_id: Uuid,
     contract_version_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
+    if let Ok((source_code, _verification_id)) =
+        ml_detector::source_for_contract(state, contract_id, None).await
+    {
+        let scan = persist_pattern_scan(
+            state,
+            contract_id,
+            contract_version_id,
+            source_code,
+            "full",
+            "upload",
+        )
+        .await?;
+        return Ok(scan.id);
+    }
+
     let scan = sqlx::query_as::<_, SecurityScan>(
         r#"
         INSERT INTO security_scans
@@ -438,4 +514,132 @@ pub async fn auto_scan_contract(
     .map_err(|e| ApiError::internal(format!("Failed to create auto scan: {}", e)))?;
 
     Ok(scan.id)
+}
+
+async fn persist_pattern_scan(
+    state: &AppState,
+    contract_id: Uuid,
+    contract_version_id: Option<Uuid>,
+    source_code: String,
+    scan_type: &str,
+    triggered_by_event: &str,
+) -> Result<SecurityScan, ApiError> {
+    let started = std::time::Instant::now();
+    let findings = vulnerability_database::scan_source(&source_code);
+    let critical = findings
+        .iter()
+        .filter(|finding| finding.severity == IssueSeverity::Critical)
+        .count() as i32;
+    let high = findings
+        .iter()
+        .filter(|finding| finding.severity == IssueSeverity::High)
+        .count() as i32;
+    let medium = findings
+        .iter()
+        .filter(|finding| finding.severity == IssueSeverity::Medium)
+        .count() as i32;
+    let low = findings
+        .iter()
+        .filter(|finding| finding.severity == IssueSeverity::Low)
+        .count() as i32;
+    let score = vulnerability_database::severity_score(&findings);
+
+    let scan = sqlx::query_as::<_, SecurityScan>(
+        r#"
+        INSERT INTO security_scans
+            (contract_id, contract_version_id, scanner_id, status, scan_type, triggered_by_event,
+             total_issues, critical_issues, high_issues, medium_issues, low_issues,
+             scan_duration_ms, scanner_version, scan_parameters, scan_result_raw,
+             started_at, completed_at, created_at, updated_at)
+        VALUES
+            ($1, $2, NULL, 'completed', $3, $4,
+             $5, $6, $7, $8, $9,
+             $10, 'local-pattern-db-v1', $11, $12, NOW(), NOW(), NOW(), NOW())
+        RETURNING *
+        "#,
+    )
+    .bind(contract_id)
+    .bind(contract_version_id)
+    .bind(scan_type)
+    .bind(triggered_by_event)
+    .bind(findings.len() as i32)
+    .bind(critical)
+    .bind(high)
+    .bind(medium)
+    .bind(low)
+    .bind(started.elapsed().as_millis().min(i32::MAX as u128) as i32)
+    .bind(serde_json::json!({
+        "database": "built_in",
+        "pattern_count": vulnerability_database::built_in_patterns().len(),
+    }))
+    .bind(serde_json::json!({
+        "scanner": "local-pattern-db-v1",
+        "score": score,
+        "findings": findings,
+    }))
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| ApiError::internal(format!("Failed to create vulnerability scan: {}", e)))?;
+
+    for finding in &findings {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO security_issues
+                (id, scan_id, contract_id, contract_version_id, title, description, severity, status,
+                 category, cwe_id, cve_id, source_file, source_line_start, source_line_end,
+                 code_snippet, remediation, reference_urls, external_issue_id,
+                 is_false_positive, created_at, updated_at)
+            VALUES
+                ($1, $2, $3, $4, $5, $6, $7, 'open',
+                 $8, $9, $10, 'source.rs', $11, $12,
+                 $13, $14, $15, $16, false, NOW(), NOW())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(scan.id)
+        .bind(contract_id)
+        .bind(contract_version_id)
+        .bind(finding.title)
+        .bind(finding.description)
+        .bind(&finding.severity)
+        .bind(finding.category)
+        .bind(finding.cwe_id)
+        .bind(finding.cve_id)
+        .bind(Some(finding.line))
+        .bind(Some(finding.line))
+        .bind(Some(finding.snippet.clone()))
+        .bind(Some(finding.remediation.to_string()))
+        .bind(Some(finding.references.clone()))
+        .bind(Some(finding.pattern_id.to_string()))
+        .execute(&state.db)
+        .await;
+    }
+
+    if let Some(version_id) = contract_version_id {
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO security_score_history
+                (id, contract_id, contract_version_id, overall_score, score_breakdown,
+                 critical_count, high_count, medium_count, low_count, scan_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(contract_id)
+        .bind(version_id)
+        .bind(score)
+        .bind(serde_json::json!({
+            "scanner": "local-pattern-db-v1",
+            "total_findings": findings.len(),
+        }))
+        .bind(critical)
+        .bind(high)
+        .bind(medium)
+        .bind(low)
+        .bind(scan.id)
+        .execute(&state.db)
+        .await;
+    }
+
+    Ok(scan)
 }

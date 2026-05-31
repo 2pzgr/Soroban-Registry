@@ -32,6 +32,8 @@ interface FilterPanelProps {
   onAuthorChange: (value: string) => void;
   verifiedOnly: boolean;
   onVerifiedChange: (value: boolean) => void;
+  favoritesOnly?: boolean;
+  onFavoritesChange?: (value: boolean) => void;
   activeFilterCount: number;
   onResetAll: () => void;
 }
@@ -155,6 +157,12 @@ function MultiSelectDropdown({
                 );
               })}
             </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function CheckboxGroup({
   title,
@@ -222,6 +230,8 @@ export function FilterPanel({
   onAuthorChange,
   verifiedOnly,
   onVerifiedChange,
+  favoritesOnly,
+  onFavoritesChange,
   activeFilterCount,
   onResetAll,
 }: FilterPanelProps) {
@@ -239,9 +249,25 @@ export function FilterPanel({
     }));
   };
 
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-foreground">Filters</h3>
+        {activeFilterCount > 0 && (
+          <button
+            type="button"
+            onClick={onResetAll}
+            className="text-xs text-muted-foreground hover:text-primary flex items-center gap-1 transition-colors"
+          >
+            <RotateCcw className="w-3 h-3" />
+            Reset all
+          </button>
+        )}
+      </div>
+
       <CheckboxGroup
         title="Network"
-        options={networks}
+        options={networks.map((n) => n.value)}
         selected={selectedNetworks}
         onToggle={onToggleNetwork}
       />
@@ -291,6 +317,36 @@ export function FilterPanel({
           )}
         </div>
         Verified only
+      </button>
+
+      {languages.length > 0 && (
+        <CheckboxGroup
+          title="Languages"
+          options={languages}
+          selected={selectedLanguages}
+          onToggle={onToggleLanguage}
+        />
+      )}
+
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={favoritesOnly}
+        onClick={() => onFavoritesChange?.(!favoritesOnly)}
+        className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-all ${
+          favoritesOnly
+            ? "bg-yellow-500/10 text-yellow-600 font-medium"
+            : "text-muted-foreground hover:text-foreground hover:bg-accent"
+        }`}
+      >
+        <div
+          className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${
+            favoritesOnly ? "bg-yellow-500 border-yellow-500" : "border-border"
+          }`}
+        >
+          {favoritesOnly && <Check className="w-3 h-3 text-white" />}
+        </div>
+        Favorites only
       </button>
     </div>
   );

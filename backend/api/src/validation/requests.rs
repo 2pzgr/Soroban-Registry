@@ -4,9 +4,10 @@
 //! that need validation when received from clients.
 
 use shared::models::{
-    ChangePublisherRequest, ContractExportRequest, CreateContractVersionRequest,
-    CreateInteractionBatchRequest, CreateInteractionRequest, CreateMigrationRequest,
-    DependencyDeclaration, PublishRequest, Publisher, UpdateContractMetadataRequest,
+    AdvancedSearchRequest, BulkStatusUpdateRequest, ChangePublisherRequest, ContractExportRequest,
+    ContractImportRequest, CreateContractVersionRequest, CreateInteractionBatchRequest,
+    CreateInteractionRequest, CreateMigrationRequest, DependencyDeclaration, PublishRequest,
+    Publisher, SaveFavoriteSearchRequest, UpdateContractMetadataRequest,
     UpdateContractStatusRequest, UpdateMigrationStatusRequest, VerifyRequest,
 };
 
@@ -525,6 +526,52 @@ impl Validatable for UpdateContractStatusRequest {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BulkStatusUpdateRequest validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Validatable for BulkStatusUpdateRequest {
+    fn sanitize(&mut self) {
+        for item in &mut self.items {
+            item.status = trim(&item.status).to_lowercase();
+            if let Some(ref mut msg) = item.error_message {
+                *msg = trim(msg);
+                if msg.is_empty() {
+                    item.error_message = None;
+                }
+            }
+        }
+    }
+
+    fn validate(&self) -> Result<(), Vec<FieldError>> {
+        let mut builder = ValidationBuilder::new();
+
+        builder.check("items", || {
+            if self.items.is_empty() {
+                return Err("at least one item is required".to_string());
+            }
+            Ok(())
+        });
+
+        for (index, item) in self.items.iter().enumerate() {
+            builder.check(&format!("items[{index}].status"), || {
+                match item.status.as_str() {
+                    "pending" | "verified" | "failed" => Ok(()),
+                    _ => Err("status must be pending, verified, or failed".to_string()),
+                }
+            });
+
+            if let Some(ref msg) = item.error_message {
+                builder.check(&format!("items[{index}].error_message"), || {
+                    validate_no_xss(msg)
+                });
+            }
+        }
+
+        builder.build()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Publisher validation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -588,6 +635,185 @@ impl Validatable for DependencyDeclaration {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ContractImportRequest validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Validatable for ContractImportRequest {
+    fn sanitize(&mut self) {
+        for contract in &mut self.contracts {
+            contract.contract_id = normalize_contract_id(&contract.contract_id);
+            contract.wasm_hash = trim(&contract.wasm_hash);
+            contract.name = sanitize_name(&contract.name);
+            sanitize_description_optional(&mut contract.description);
+            contract.publisher_address = normalize_stellar_address(&contract.publisher_address);
+
+            if let Some(ref mut cat) = contract.category {
+                *cat = trim(cat);
+                if cat.is_empty() {
+                    contract.category = None;
+                }
+            }
+
+            if let Some(ref mut tags) = contract.tags {
+                *tags = sanitize_tags(tags);
+                if tags.is_empty() {
+                    contract.tags = None;
+                }
+            }
+
+            if let Some(ref mut visibility) = contract.visibility {
+                *visibility = trim(visibility).to_lowercase();
+            }
+
+            if let Some(ref mut versions) = contract.versions {
+                for version in versions.iter_mut() {
+                    version.version = trim(&version.version);
+                    version.wasm_hash = trim(&version.wasm_hash);
+                    if let Some(ref mut url) = version.source_url {
+                        *url = trim(url);
+                    }
+                    if let Some(ref mut hash) = version.commit_hash {
+                        *hash = trim(hash);
+                    }
+                    if let Some(ref mut notes) = version.release_notes {
+                        *notes = trim(notes);
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate(&self) -> Result<(), Vec<FieldError>> {
+        let mut builder = ValidationBuilder::new();
+
+        if self.contracts.is_empty() {
+            builder.add_error("contracts", "at least one contract is required");
+        }
+
+        if self.contracts.len() > 10_000 {
+            builder.add_error("contracts", "maximum 10,000 contracts per batch");
+        }
+
+        for (i, contract) in self.contracts.iter().enumerate() {
+            let prefix = format!("contracts[{}]", i);
+
+            builder.check(&format!("{}.contract_id", prefix), || {
+                validate_contract_id(&contract.contract_id)
+            });
+
+            builder.check(&format!("{}.wasm_hash", prefix), || {
+                validate_wasm_hash(&contract.wasm_hash)
+            });
+
+            builder.check(&format!("{}.name", prefix), || {
+                if contract.name.is_empty() {
+                    return Err("name is required".to_string());
+                }
+                validate_length(&contract.name, MIN_NAME_LENGTH, MAX_NAME_LENGTH)
+            });
+            builder.check(&format!("{}.name", prefix), || {
+                validate_no_xss(&contract.name)
+            });
+
+            builder.check(&format!("{}.publisher_address", prefix), || {
+                validate_stellar_address(&contract.publisher_address)
+            });
+
+            if let Some(ref desc) = contract.description {
+                builder.check(&format!("{}.description", prefix), || {
+                    validate_length(desc, 0, MAX_DESCRIPTION_LENGTH)
+                });
+                builder.check(&format!("{}.description", prefix), || validate_no_xss(desc));
+            }
+
+            if let Some(ref cat) = contract.category {
+                builder.check(&format!("{}.category", prefix), || {
+                    validate_category_whitelist(cat, ALLOWED_CATEGORIES)
+                });
+                builder.check(&format!("{}.category", prefix), || validate_no_xss(cat));
+            }
+
+            if let Some(ref tags) = contract.tags {
+                builder.check(&format!("{}.tags", prefix), || {
+                    validate_tags(tags, MAX_TAGS_COUNT, MAX_TAG_LENGTH)
+                });
+            }
+
+            if let Some(ref versions) = contract.versions {
+                for (vi, version) in versions.iter().enumerate() {
+                    let vprefix = format!("{}.versions[{}]", prefix, vi);
+
+                    builder.check(&format!("{}.version", vprefix), || {
+                        if version.version.is_empty() {
+                            return Err("version is required".to_string());
+                        }
+                        validate_semver(&version.version)
+                    });
+
+                    builder.check(&format!("{}.wasm_hash", vprefix), || {
+                        validate_wasm_hash(&version.wasm_hash)
+                    });
+
+                    if let Some(ref url) = version.source_url {
+                        builder.check(&format!("{}.source_url", vprefix), || {
+                            validate_url_optional(&Some(url.clone()))
+                        });
+                    }
+                }
+            }
+        }
+
+        builder.build()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SaveFavoriteSearchRequest validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Validatable for SaveFavoriteSearchRequest {
+    fn sanitize(&mut self) {
+        self.user_address = normalize_stellar_address(&self.user_address);
+        self.name = sanitize_name(&self.name);
+        super::sanitizers::sanitize_json_value(&mut self.query_json);
+    }
+
+    fn validate(&self) -> Result<(), Vec<FieldError>> {
+        let mut builder = ValidationBuilder::new();
+        builder.check("user_address", || {
+            validate_stellar_address(&self.user_address)
+        });
+        builder.check("name", || validate_length(&self.name, 1, 100));
+        builder.check("name", || validate_no_xss(&self.name));
+        builder.check("query_json", || {
+            validate_json_depth(&self.query_json, MAX_JSON_DEPTH)
+        });
+        builder.build()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AdvancedSearchRequest validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Validatable for AdvancedSearchRequest {
+    fn sanitize(&mut self) {
+        // No direct sanitization needed for the query tree currently
+    }
+
+    fn validate(&self) -> Result<(), Vec<FieldError>> {
+        let mut builder = ValidationBuilder::new();
+        // Pagination limits
+        if let Some(limit) = self.limit {
+            if limit <= 0 || limit > 100 {
+                builder.add_error("limit", "limit must be between 1 and 100");
+            }
+        }
+        builder.build()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +833,7 @@ mod tests {
             contract_id: valid_contract_id(),
             wasm_hash: "a".repeat(64),
             name: "My Contract".to_string(),
+            slug: None,
             description: Some("A test contract".to_string()),
             network: Network::Testnet,
             category: Some("Token".to_string()),
@@ -626,6 +853,7 @@ mod tests {
             contract_id: "invalid".to_string(),
             wasm_hash: "a".repeat(64),
             name: "My Contract".to_string(),
+            slug: None,
             description: None,
             network: Network::Testnet,
             category: None,
@@ -648,6 +876,7 @@ mod tests {
             contract_id: valid_contract_id(),
             wasm_hash: "invalid".to_string(),
             name: "My Contract".to_string(),
+            slug: None,
             description: None,
             network: Network::Testnet,
             category: None,
@@ -670,6 +899,7 @@ mod tests {
             contract_id: "  cdlzfc3syjydzt7k67vz75hpjvieuvnixf47zg2fb2rmqqvu2hhgcysc  ".to_string(),
             wasm_hash: format!("  {}  ", "a".repeat(64)),
             name: "  <b>My Contract</b>  ".to_string(),
+            slug: None,
             description: Some("  <script>alert('xss')</script>Description  ".to_string()),
             network: Network::Testnet,
             category: Some("  DeFi  ".to_string()),

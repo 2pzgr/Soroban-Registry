@@ -1,9 +1,11 @@
 use opentelemetry::global;
 use opentelemetry::propagation::Injector;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::Resource;
+use std::borrow::Cow;
 
 pub fn init_tracing(service_name: &str) {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -17,21 +19,31 @@ pub fn init_tracing(service_name: &str) {
     let otlp_endpoint = std::env::var("OTLP_ENDPOINT")
         .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
         .ok();
-    let service_name = std::env::var("OTEL_SERVICE_NAME")
-        .unwrap_or_else(|_| service_name.to_string());
+    let service_name =
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| service_name.to_string());
+
+    // Clone before the move into Resource::new so we can use it again for
+    // provider.tracer(&tracer_name) without a use-after-move error.
+    let tracer_name = service_name.clone();
 
     if let Some(endpoint) = otlp_endpoint {
-        let trace_config = opentelemetry_sdk::trace::Config::default().with_resource(
-            Resource::new(vec![KeyValue::new("service.name", service_name)]),
-        );
+        let trace_config =
+            opentelemetry_sdk::trace::Config::default().with_resource(Resource::new(vec![
+                KeyValue::new("service.name", service_name),
+            ]));
 
         match opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_trace_config(trace_config)
-            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint))
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    .with_endpoint(endpoint),
+            )
             .install_batch(opentelemetry_sdk::runtime::Tokio)
         {
-            Ok(tracer) => {
+            Ok(provider) => {
+                let tracer = provider.tracer(Cow::Owned(tracer_name));
                 tracing_subscriber::registry()
                     .with(env_filter)
                     .with(fmt_layer)

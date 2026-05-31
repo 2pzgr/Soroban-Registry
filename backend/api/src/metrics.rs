@@ -132,6 +132,11 @@ pub static DB_CONNECTIONS_ACTIVE: Lazy<IntGauge> =
 pub static DB_CONNECTIONS_IDLE: Lazy<IntGauge> =
     gauge!("db_connections_idle", "Idle DB connections");
 pub static DB_QUERY_ERRORS: Lazy<IntCounter> = counter!("db_query_errors_total", "DB query errors");
+// Issue #887: application-side query observation counters.
+pub static DB_QUERIES_OBSERVED: Lazy<IntCounter> =
+    counter!("db_queries_observed_total", "Queries observed by the app-side analyzer");
+pub static DB_SLOW_QUERIES: Lazy<IntCounter> =
+    counter!("db_slow_queries_total", "Queries exceeding the slow threshold");
 pub static DB_TRANSACTIONS_TOTAL: Lazy<IntCounter> =
     counter!("db_transactions_total", "Total DB transactions");
 pub static DB_POOL_SIZE: Lazy<IntGauge> = gauge!("db_pool_size", "DB connection pool size");
@@ -182,8 +187,10 @@ pub static VERIFICATION_CACHE_MISSES: Lazy<IntCounter> = counter!(
     "verification_cache_misses_total",
     "Verification cache misses"
 );
-pub static CONTRACTS_CACHE_HITS: Lazy<IntCounter> = counter!("contracts_cache_hits_total", "Contracts cache hits");
-pub static CONTRACTS_CACHE_MISSES: Lazy<IntCounter> = counter!("contracts_cache_misses_total", "Contracts cache misses");
+pub static CONTRACTS_CACHE_HITS: Lazy<IntCounter> =
+    counter!("contracts_cache_hits_total", "Contracts cache hits");
+pub static CONTRACTS_CACHE_MISSES: Lazy<IntCounter> =
+    counter!("contracts_cache_misses_total", "Contracts cache misses");
 
 pub static REDIS_CACHE_HITS: Lazy<IntCounter> =
     counter!("redis_cache_hits_total", "Redis cache hits");
@@ -264,6 +271,36 @@ pub static PROCESS_START_TIME: Lazy<IntGauge> =
 pub static BUILD_INFO: Lazy<IntGaugeVec> =
     gauge_vec!("build_info", "Build information", &["version", "commit"]);
 
+// ── Client-side breaker metrics ─────────────────────────────────────────────
+pub static CLIENT_BREAKER_OPEN: Lazy<IntGaugeVec> = gauge_vec!(
+    "client_breaker_open",
+    "Client-side circuit breaker open state (1=open, 0=closed)",
+    &["endpoint"]
+);
+
+// ── Database Resilience Metrics ─────────────────────────────────────────────
+pub static DB_RESILIENCE_QUEUE_DEPTH: Lazy<IntGauge> = gauge!(
+    "db_resilience_queue_depth",
+    "Current requests waiting in the DB connection queue"
+);
+pub static DB_RESILIENCE_ACTIVE_REQS: Lazy<IntGauge> = gauge!(
+    "db_resilience_active_reqs",
+    "Active requests holding a DB concurrency permit"
+);
+pub static DB_RESILIENCE_BREAKER_STATE: Lazy<IntGauge> = gauge!(
+    "db_resilience_breaker_state",
+    "Database circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)"
+);
+pub static DB_RESILIENCE_BREAKER_TRIPS: Lazy<IntCounter> = counter!(
+    "db_resilience_breaker_trips_total",
+    "Total database circuit breaker trips"
+);
+pub static DB_RESILIENCE_REJECTIONS: Lazy<IntCounterVec> = counter_vec!(
+    "db_resilience_rejections_total",
+    "Total requests rejected by database resilience",
+    &["reason"]
+);
+
 // ── SLO ─────────────────────────────────────────────────────────────────────
 pub static SLO_ERROR_BUDGET: Lazy<GaugeVec> = gauge_f64_vec!(
     "slo_error_budget_remaining",
@@ -316,6 +353,8 @@ pub fn register_all(r: &Registry) -> prometheus::Result<()> {
     r.register(Box::new(DB_CONNECTIONS_ACTIVE.clone()))?;
     r.register(Box::new(DB_CONNECTIONS_IDLE.clone()))?;
     r.register(Box::new(DB_QUERY_ERRORS.clone()))?;
+    r.register(Box::new(DB_QUERIES_OBSERVED.clone()))?;
+    r.register(Box::new(DB_SLOW_QUERIES.clone()))?;
     r.register(Box::new(DB_TRANSACTIONS_TOTAL.clone()))?;
     r.register(Box::new(DB_POOL_SIZE.clone()))?;
     r.register(Box::new(DB_CONNECTION_WAIT_MS.clone()))?;
@@ -355,6 +394,12 @@ pub fn register_all(r: &Registry) -> prometheus::Result<()> {
     r.register(Box::new(MULTISIG_REJECTIONS.clone()))?;
     r.register(Box::new(PROCESS_START_TIME.clone()))?;
     r.register(Box::new(BUILD_INFO.clone()))?;
+    r.register(Box::new(CLIENT_BREAKER_OPEN.clone()))?;
+    r.register(Box::new(DB_RESILIENCE_QUEUE_DEPTH.clone()))?;
+    r.register(Box::new(DB_RESILIENCE_ACTIVE_REQS.clone()))?;
+    r.register(Box::new(DB_RESILIENCE_BREAKER_STATE.clone()))?;
+    r.register(Box::new(DB_RESILIENCE_BREAKER_TRIPS.clone()))?;
+    r.register(Box::new(DB_RESILIENCE_REJECTIONS.clone()))?;
     r.register(Box::new(SLO_ERROR_BUDGET.clone()))?;
     r.register(Box::new(SLO_BURN_RATE.clone()))?;
     r.register(Box::new(SLO_AVAILABILITY.clone()))?;

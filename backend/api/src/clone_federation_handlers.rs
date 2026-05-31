@@ -1,8 +1,9 @@
 //! Contract Clone and Federation Handlers
-//! 
+//!
 //! #487: Contract Mirror/Clone Endpoint
 //! #499: Federated Contract Registry Protocol
 
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, Query, State},
     http::{header::HeaderMap, StatusCode},
@@ -18,12 +19,11 @@ use crate::{
     state::AppState,
 };
 use shared::{
-    AuditActionType, CloneContractRequest, CloneContractResponse, Contract,
-    DuplicateDetectionResult, FederatedRegistry, FederatedRegistryListResponse,
-    FederatedRegistryResponse, FederatedRegistrySummary, FederationAttribution,
-    FederationDiscoveryResponse, FederationOptRequest, FederationProtocolConfig,
-    FederationSyncHistoryResponse, FederationSyncJob, FederationSyncResponse,
-    Network, RegisterFederatedRegistryRequest, SyncFederatedRegistryRequest,
+    AuditActionType, CloneContractRequest, CloneContractResponse, Contract, FederatedRegistry,
+    FederatedRegistryListResponse, FederatedRegistryResponse, FederatedRegistrySummary,
+    FederationAttribution, FederationDiscoveryResponse, FederationOptRequest,
+    FederationProtocolConfig, FederationSyncHistoryResponse, FederationSyncJob,
+    FederationSyncResponse, RegisterFederatedRegistryRequest, SyncFederatedRegistryRequest,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -49,11 +49,11 @@ pub async fn clone_contract(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<CloneContractRequest>,
+    ValidatedJson(req): ValidatedJson<CloneContractRequest>,
 ) -> ApiResult<Json<CloneContractResponse>> {
     // Resolve the source contract ID
     let source_uuid = resolve_contract_id(&state.db, &id).await?;
-    
+
     // Fetch the original contract
     let original: Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
         .bind(source_uuid)
@@ -68,7 +68,10 @@ pub async fn clone_contract(
         })?;
 
     // Check if the new contract_id already exists on the target network
-    let target_network = req.network.clone().unwrap_or_else(|| original.network.clone());
+    let target_network = req
+        .network
+        .clone()
+        .unwrap_or_else(|| original.network.clone());
     let existing = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM contracts WHERE contract_id = $1 AND network = $2",
     )
@@ -92,12 +95,23 @@ pub async fn clone_contract(
     let publisher_id = req.publisher_id.unwrap_or(original.publisher_id);
 
     // Build new name
-    let new_name = req.name.unwrap_or_else(|| format!("{} Clone", original.name));
+    let new_name = req
+        .name
+        .unwrap_or_else(|| format!("{} Clone", original.name));
 
     // Start transaction
-    let mut tx = state.db.begin().await.map_err(|err| {
-        db_internal_error("begin transaction", err)
-    })?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| db_internal_error("begin transaction", err))?;
+
+    // Resolve tags: map Vec<Tag> -> Vec<String> for sqlx binding
+    let tags_strings: Vec<String> = req
+        .tags
+        .as_ref()
+        .map(|tags| tags.iter().map(|t| t.clone()).collect())
+        .unwrap_or_else(|| original.tags.iter().map(|t| t.name.clone()).collect());
 
     // Insert the cloned contract
     let clone: Contract = sqlx::query_as(
@@ -113,11 +127,15 @@ pub async fn clone_contract(
     .bind(&req.contract_id)
     .bind(req.wasm_hash.as_deref().unwrap_or(&original.wasm_hash))
     .bind(&new_name)
-    .bind(req.description.as_deref().or(original.description.as_deref()))
+    .bind(
+        req.description
+            .as_deref()
+            .or(original.description.as_deref()),
+    )
     .bind(publisher_id)
     .bind(&target_network)
     .bind(req.category.as_deref().or(original.category.as_deref()))
-    .bind(req.tags.as_deref().unwrap_or(&original.tags))
+    .bind(&tags_strings as &[String])
     .bind(original.id)
     .bind(original.logical_id)
     .bind(&original.network_configs)
@@ -126,10 +144,10 @@ pub async fn clone_contract(
     .map_err(|err| db_internal_error("insert cloned contract", err))?;
 
     // Copy ABI from original contract
-    let abi_copied = copy_contract_abi(&mut *tx, original.id, clone.id).await?;
+    let abi_copied = copy_contract_abi(&mut tx, original.id, clone.id).await?;
 
     // Copy contract versions
-    copy_contract_versions(&mut *tx, original.id, clone.id).await?;
+    copy_contract_versions(&mut tx, original.id, clone.id).await?;
 
     // Record clone history
     let metadata_overrides = json!({
@@ -162,9 +180,9 @@ pub async fn clone_contract(
         .await
         .map_err(|err| db_internal_error("increment clone count", err))?;
 
-    tx.commit().await.map_err(|err| {
-        db_internal_error("commit transaction", err)
-    })?;
+    tx.commit()
+        .await
+        .map_err(|err| db_internal_error("commit transaction", err))?;
 
     // Write audit log
     let changes = json!({
@@ -179,7 +197,8 @@ pub async fn clone_contract(
 
     write_contract_audit_log(
         &state.db,
-        AuditActionType::ContractCreated,
+        // FIX: use the correct variant name from shared::AuditActionType
+        AuditActionType::ContractPublished,
         clone.id,
         publisher_id,
         changes,
@@ -211,7 +230,7 @@ pub async fn clone_contract(
         ("id" = String, Path, description = "Contract ID")
     ),
     responses(
-        (status = 200, description = "List of clones", body = [ContractCloneHistory]),
+        (status = 200, description = "List of clones", body = [Contract]),
         (status = 404, description = "Contract not found")
     ),
     tag = "Contracts"
@@ -249,12 +268,11 @@ pub async fn get_contract_clones(
 pub async fn list_federated_registries(
     State(state): State<AppState>,
 ) -> ApiResult<Json<FederatedRegistryListResponse>> {
-    let registries: Vec<FederatedRegistry> = sqlx::query_as(
-        "SELECT * FROM federated_registries ORDER BY created_at DESC",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| db_internal_error("list federated registries", err))?;
+    let registries: Vec<FederatedRegistry> =
+        sqlx::query_as("SELECT * FROM federated_registries ORDER BY created_at DESC")
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_internal_error("list federated registries", err))?;
 
     let total = registries.len() as i64;
     Ok(Json(FederatedRegistryListResponse {
@@ -276,9 +294,11 @@ pub async fn list_federated_registries(
 )]
 pub async fn register_federated_registry(
     State(state): State<AppState>,
-    Json(req): Json<RegisterFederatedRegistryRequest>,
+    ValidatedJson(req): ValidatedJson<RegisterFederatedRegistryRequest>,
 ) -> ApiResult<Json<FederatedRegistryResponse>> {
-    let protocol_version = req.federation_protocol_version.unwrap_or_else(|| "1.0".to_string());
+    let protocol_version = req
+        .federation_protocol_version
+        .unwrap_or_else(|| "1.0".to_string());
 
     let registry: FederatedRegistry = sqlx::query_as(
         r#"
@@ -337,21 +357,20 @@ pub async fn get_federated_registry(
     Path(id): Path<String>,
 ) -> ApiResult<Json<FederatedRegistry>> {
     let uuid = Uuid::parse_str(&id)
-        .map_err(|_| ApiError::bad_request("InvalidId", "Invalid registry ID format"))?;
+        .map_err(|_| ApiError::bad_request_with("InvalidId", "Invalid registry ID format"))?;
 
-    let registry: FederatedRegistry = sqlx::query_as(
-        "SELECT * FROM federated_registries WHERE id = $1",
-    )
-    .bind(uuid)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|err| {
-        if matches!(err, sqlx::Error::RowNotFound) {
-            ApiError::not_found("RegistryNotFound", "Federated registry not found")
-        } else {
-            db_internal_error("fetch federated registry", err)
-        }
-    })?;
+    let registry: FederatedRegistry =
+        sqlx::query_as("SELECT * FROM federated_registries WHERE id = $1")
+            .bind(uuid)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| {
+                if matches!(err, sqlx::Error::RowNotFound) {
+                    ApiError::not_found("RegistryNotFound", "Federated registry not found")
+                } else {
+                    db_internal_error("fetch federated registry", err)
+                }
+            })?;
 
     Ok(Json(registry))
 }
@@ -370,25 +389,21 @@ pub async fn get_federated_registry(
 )]
 pub async fn sync_from_federated_registry(
     State(state): State<AppState>,
-    Json(req): Json<SyncFederatedRegistryRequest>,
+    ValidatedJson(req): ValidatedJson<SyncFederatedRegistryRequest>,
 ) -> ApiResult<Json<FederationSyncResponse>> {
     // Verify registry exists and is active
-    let registry: FederatedRegistry = sqlx::query_as(
-        "SELECT * FROM federated_registries WHERE id = $1 AND is_active = true",
-    )
-    .bind(req.registry_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|err| {
-        if matches!(err, sqlx::Error::RowNotFound) {
-            ApiError::not_found(
-                "RegistryNotFound",
-                "Registry not found or not active",
-            )
-        } else {
-            db_internal_error("fetch registry", err)
-        }
-    })?;
+    let registry: FederatedRegistry =
+        sqlx::query_as("SELECT * FROM federated_registries WHERE id = $1 AND is_active = true")
+            .bind(req.registry_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| {
+                if matches!(err, sqlx::Error::RowNotFound) {
+                    ApiError::not_found("RegistryNotFound", "Registry not found or not active")
+                } else {
+                    db_internal_error("fetch registry", err)
+                }
+            })?;
 
     // Create sync job
     let job: FederationSyncJob = sqlx::query_as(
@@ -404,13 +419,11 @@ pub async fn sync_from_federated_registry(
     .map_err(|err| db_internal_error("create sync job", err))?;
 
     // Update registry status
-    sqlx::query(
-        "UPDATE federated_registries SET sync_status = 'syncing' WHERE id = $1",
-    )
-    .bind(req.registry_id)
-    .execute(&state.db)
-    .await
-    .map_err(|err| db_internal_error("update registry sync status", err))?;
+    sqlx::query("UPDATE federated_registries SET sync_status = 'syncing' WHERE id = $1")
+        .bind(req.registry_id)
+        .execute(&state.db)
+        .await
+        .map_err(|err| db_internal_error("update registry sync status", err))?;
 
     // Spawn background task to perform the actual sync
     tokio::spawn(async move {
@@ -450,21 +463,19 @@ pub async fn get_sync_job_status(
     Path(job_id): Path<String>,
 ) -> ApiResult<Json<FederationSyncJob>> {
     let uuid = Uuid::parse_str(&job_id)
-        .map_err(|_| ApiError::bad_request("InvalidId", "Invalid job ID format"))?;
+        .map_err(|_| ApiError::bad_request_with("InvalidId", "Invalid job ID format"))?;
 
-    let job: FederationSyncJob = sqlx::query_as(
-        "SELECT * FROM federation_sync_jobs WHERE id = $1",
-    )
-    .bind(uuid)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|err| {
-        if matches!(err, sqlx::Error::RowNotFound) {
-            ApiError::not_found("SyncJobNotFound", "Sync job not found")
-        } else {
-            db_internal_error("fetch sync job", err)
-        }
-    })?;
+    let job: FederationSyncJob = sqlx::query_as("SELECT * FROM federation_sync_jobs WHERE id = $1")
+        .bind(uuid)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|err| {
+            if matches!(err, sqlx::Error::RowNotFound) {
+                ApiError::not_found("SyncJobNotFound", "Sync job not found")
+            } else {
+                db_internal_error("fetch sync job", err)
+            }
+        })?;
 
     Ok(Json(job))
 }
@@ -527,14 +538,13 @@ pub struct SyncHistoryQuery {
 pub async fn discover_federated_registries(
     State(state): State<AppState>,
 ) -> ApiResult<Json<FederationDiscoveryResponse>> {
-    let registries: Vec<FederatedRegistry> = sqlx::query_as(
-        "SELECT * FROM federated_registries WHERE is_active = true ORDER BY name",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| db_internal_error("discover registries", err))?;
+    let registries: Vec<FederatedRegistry> =
+        sqlx::query_as("SELECT * FROM federated_registries WHERE is_active = true ORDER BY name")
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_internal_error("discover registries", err))?;
 
-    let summaries = registries
+    let summaries: Vec<FederatedRegistrySummary> = registries
         .into_iter()
         .map(|r| FederatedRegistrySummary {
             id: r.id,
@@ -546,9 +556,11 @@ pub async fn discover_federated_registries(
         })
         .collect();
 
+    // FIX: capture total_count before moving summaries into the struct
+    let total_count = summaries.len() as i64;
     Ok(Json(FederationDiscoveryResponse {
         registries: summaries,
-        total_count: summaries.len() as i64,
+        total_count,
         discovered_at: chrono::Utc::now(),
     }))
 }
@@ -617,7 +629,7 @@ pub async fn get_contract_federation_attribution(
 pub async fn update_contract_federation_settings(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<FederationOptRequest>,
+    ValidatedJson(req): ValidatedJson<FederationOptRequest>,
 ) -> ApiResult<StatusCode> {
     let contract_uuid = resolve_contract_id(&state.db, &id).await?;
 
@@ -655,12 +667,11 @@ pub async fn update_contract_federation_settings(
 pub async fn get_federation_config(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<FederationProtocolConfig>>> {
-    let config: Vec<FederationProtocolConfig> = sqlx::query_as(
-        "SELECT * FROM federation_protocol_config ORDER BY config_key",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|err| db_internal_error("fetch federation config", err))?;
+    let config: Vec<FederationProtocolConfig> =
+        sqlx::query_as("SELECT * FROM federation_protocol_config ORDER BY config_key")
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_internal_error("fetch federation config", err))?;
 
     Ok(Json(config))
 }
@@ -683,11 +694,18 @@ async fn resolve_contract_id(db: &PgPool, identifier: &str) -> ApiResult<Uuid> {
         .map_err(|err| db_internal_error("resolve contract id", err))?;
 
     uuid.ok_or_else(|| {
-        ApiError::not_found("ContractNotFound", format!("Contract '{}' not found", identifier))
+        ApiError::not_found(
+            "ContractNotFound",
+            format!("Contract '{}' not found", identifier),
+        )
     })
 }
 
-async fn copy_contract_abi(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, from: Uuid, to: Uuid) -> ApiResult<bool> {
+async fn copy_contract_abi(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    from: Uuid,
+    to: Uuid,
+) -> ApiResult<bool> {
     let result = sqlx::query(
         r#"
         INSERT INTO contract_abis (contract_id, abi_json, schema_json, created_at)
@@ -706,7 +724,11 @@ async fn copy_contract_abi(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, from:
     Ok(result.is_some())
 }
 
-async fn copy_contract_versions(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, from: Uuid, to: Uuid) -> ApiResult<()> {
+async fn copy_contract_versions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    from: Uuid,
+    to: Uuid,
+) -> ApiResult<()> {
     sqlx::query(
         r#"
         INSERT INTO contract_versions (
@@ -731,34 +753,30 @@ async fn copy_contract_versions(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, 
 }
 
 /// Background task to perform federation sync
-async fn perform_federation_sync(
-    db: PgPool,
-    job_id: Uuid,
-    registry_id: Uuid,
-    batch_size: i32,
-) {
+async fn perform_federation_sync(db: PgPool, job_id: Uuid, registry_id: Uuid, batch_size: i32) {
     use reqwest::Client;
-    
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .unwrap_or_else(|_| Client::new());
 
     // Update job status to running
-    let _ = sqlx::query("UPDATE federation_sync_jobs SET status = 'running', started_at = NOW() WHERE id = $1")
-        .bind(job_id)
-        .execute(&db)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE federation_sync_jobs SET status = 'running', started_at = NOW() WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(&db)
+    .await;
 
     // Fetch registry details
-    let registry_url: Option<String> = sqlx::query_scalar(
-        "SELECT base_url FROM federated_registries WHERE id = $1",
-    )
-    .bind(registry_id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten();
+    let registry_url: Option<String> =
+        sqlx::query_scalar("SELECT base_url FROM federated_registries WHERE id = $1")
+            .bind(registry_id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
 
     let Some(base_url) = registry_url else {
         let _ = sqlx::query(
@@ -772,17 +790,27 @@ async fn perform_federation_sync(
     };
 
     // Fetch contracts from remote registry
-    let sync_url = format!("{}/api/contracts?limit={}", base_url.trim_end_matches('/'), batch_size);
-    
-    let result = async {
+    let sync_url = format!(
+        "{}/api/contracts?limit={}",
+        base_url.trim_end_matches('/'),
+        batch_size
+    );
+
+    // FIX: use Result<_, String> with explicit .map_err(|e| e.to_string()) so
+    // reqwest::Error converts to String (the only From impl available here).
+    let result: Result<serde_json::Value, String> = async {
         let mut headers = reqwest::header::HeaderMap::new();
         crate::request_tracing::inject_current_trace_context(&mut headers);
-        let response = client.get(&sync_url).headers(headers).send().await?;
+        let response = client
+            .get(&sync_url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !response.status().is_success() {
             return Err(format!("Failed to fetch contracts: {}", response.status()));
         }
-        
-        let contracts: serde_json::Value = response.json().await?;
+        let contracts: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
         Ok(contracts)
     }
     .await;
@@ -790,11 +818,12 @@ async fn perform_federation_sync(
     match result {
         Ok(contracts_json) => {
             // Process contracts (simplified - in production would handle each contract)
-            let contracts_synced = if let Some(arr) = contracts_json.get("contracts").and_then(|v| v.as_array()) {
-                arr.len() as i32
-            } else {
-                0
-            };
+            let contracts_synced =
+                if let Some(arr) = contracts_json.get("contracts").and_then(|v| v.as_array()) {
+                    arr.len() as i32
+                } else {
+                    0
+                };
 
             let _ = sqlx::query(
                 "UPDATE federation_sync_jobs SET status = 'completed', contracts_synced = $1, completed_at = NOW() WHERE id = $2",

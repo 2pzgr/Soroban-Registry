@@ -1,8 +1,9 @@
-'use client';
+"use client";
 
 import { useState, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api, AnalyticsEvent, AnalyticsEventType, ActivityFeedResponse } from '@/lib/api';
+import { ContractDeploymentEvent, ContractUpdateEvent } from '@/types/realtime';
 import { useRealtime } from '@/hooks/useRealtime';
 import { formatPublicKey, formatShortenedText } from '@/lib/utils/formatting';
 import {
@@ -19,10 +20,11 @@ import {
   Tag,
   type LucideIcon,
 } from 'lucide-react';
+import type { TFunction } from 'i18next';
 import Link from 'next/link';
 import { useTranslation } from '@/lib/i18n/client';
 
-const getEventConfig = (t: any): Record<string, { icon: any, label: string, color: string }> => ({
+const getEventConfig = (t: TFunction): Record<string, { icon: LucideIcon; label: string; color: string }> => ({
   contract_published: { icon: Upload, label: t('activityFeed.published'), color: 'text-blue-500 bg-blue-500/10' },
   contract_verified: { icon: CheckCircle2, label: t('activityFeed.verified'), color: 'text-emerald-500 bg-emerald-500/10' },
   contract_deployed: { icon: Zap, label: t('activityFeed.deployed'), color: 'text-amber-500 bg-amber-500/10' },
@@ -34,7 +36,6 @@ const getEventConfig = (t: any): Record<string, { icon: any, label: string, colo
 export default function ActivityFeed() {
   const { t } = useTranslation('common');
   const EVENT_CONFIG = getEventConfig(t);
-  const queryClient = useQueryClient();
   const { subscribe, isConnected } = useRealtime();
 
   const [eventType, setEventType] = useState<AnalyticsEventType | 'all'>('all');
@@ -45,9 +46,9 @@ export default function ActivityFeed() {
   // Initial fetch
   const { isLoading, error, data } = useQuery<ActivityFeedResponse>({
     queryKey: ['activity-feed', eventType],
-    queryFn: () => api.getActivityFeed({ 
+    queryFn: () => api.getActivityFeed({
       event_type: eventType === 'all' ? undefined : eventType,
-      limit: 20
+      limit: 20,
     }),
   });
 
@@ -61,41 +62,38 @@ export default function ActivityFeed() {
 
   // Handle real-time events
   useEffect(() => {
-    const handleDeployment = (event: RealtimeDeploymentEvent) => {
-      // Convert RealtimeEvent to AnalyticsEvent
+    const handleDeployment = (event: ContractDeploymentEvent) => {
       const newEvent: AnalyticsEvent = {
         id: Math.random().toString(36).substring(7),
         event_type: 'contract_deployed',
-        contract_id: event.contract_id,
+        contract_id: event.contractId,
         user_address: event.publisher,
-        network: null, // We don't have it in the realtime event directly but could infer or leave null
-        metadata: { name: event.contract_name, version: event.version },
-        created_at: event.timestamp || new Date().toISOString(),
+        network: null,
+        metadata: { name: event.contractName, version: event.version },
+        created_at: event.timestamp,
       };
-
       if (eventType === 'all' || eventType === 'contract_deployed') {
-        setItems(prev => [newEvent, ...prev].slice(0, 100)); // Limit local cache
+        setItems(prev => [newEvent, ...prev].slice(0, 100));
       }
     };
 
-    const handleUpdate = (event: RealtimeUpdateEvent) => {
+    const handleUpdate = (event: ContractUpdateEvent) => {
       const newEvent: AnalyticsEvent = {
         id: Math.random().toString(36).substring(7),
         event_type: 'contract_updated',
-        contract_id: event.contract_id,
+        contract_id: event.contractId,
         user_address: null,
         network: null,
-        metadata: { update_type: event.update_type, ...event.details },
-        created_at: event.timestamp || new Date().toISOString(),
+        metadata: { update_type: event.updateType, ...event.details },
+        created_at: event.timestamp,
       };
-
       if (eventType === 'all' || eventType === 'contract_updated') {
         setItems(prev => [newEvent, ...prev].slice(0, 100));
       }
     };
 
-    const unsubDeploy = subscribe('contract_deployed', handleDeployment);
-    const unsubUpdate = subscribe('contract_updated', handleUpdate);
+    const unsubDeploy = subscribe('contract_deployed', (data: unknown) => handleDeployment(data as ContractDeploymentEvent));
+    const unsubUpdate = subscribe('contract_updated', (data: unknown) => handleUpdate(data as ContractUpdateEvent));
 
     return () => {
       unsubDeploy();
@@ -110,7 +108,7 @@ export default function ActivityFeed() {
       const res = await api.getActivityFeed({
         cursor: nextCursor,
         event_type: eventType === 'all' ? undefined : eventType,
-        limit: 20
+        limit: 20,
       });
       setItems(prev => [...prev, ...res.items]);
       setNextCursor(res.next_cursor);
@@ -130,7 +128,6 @@ export default function ActivityFeed() {
     const date = new Date(dateStr);
     const now = new Date();
     const diff = now.getTime() - date.getTime();
-    
     if (diff < 60000) return t('activityFeed.justNow');
     if (diff < 3600000) return `${Math.floor(diff / 60000)}${t('activityFeed.m_ago')}`;
     if (diff < 86400000) return `${Math.floor(diff / 3600000)}${t('activityFeed.h_ago')}`;
@@ -150,7 +147,7 @@ export default function ActivityFeed() {
 
         <div className="flex items-center gap-2 bg-card border border-border rounded-lg px-3 py-1.5 shadow-sm">
           <Filter className="w-4 h-4 text-muted-foreground" />
-          <select 
+          <select
             value={eventType}
             onChange={(e) => setEventType(e.target.value as AnalyticsEventType | 'all')}
             className="bg-transparent text-sm font-medium text-foreground focus:outline-none cursor-pointer"
@@ -182,31 +179,41 @@ export default function ActivityFeed() {
         ) : (
           <div className="divide-y divide-border">
             {items.map((item) => {
-              const config = EVENT_CONFIG[item.event_type] || { icon: Activity, label: item.event_type, color: 'text-gray-500 bg-gray-500/10' };
+              const config = EVENT_CONFIG[item.event_type] || {
+                icon: Activity,
+                label: item.event_type,
+                color: 'text-gray-500 bg-gray-500/10',
+              };
               const Icon = config.icon;
-              
+              const metadataName = typeof item.metadata?.name === 'string' ? item.metadata.name : null;
+              const metadataVersion =
+                typeof item.metadata?.version === 'string' || typeof item.metadata?.version === 'number'
+                  ? item.metadata.version
+                  : null;
+              const metadataUpdateType = typeof item.metadata?.update_type === 'string' ? item.metadata.update_type : null;
+
               return (
                 <div key={item.id} className="p-4 hover:bg-muted/30 transition-colors group">
                   <div className="flex gap-4">
                     <div className={`mt-1 p-2 rounded-full h-fit ${config.color}`}>
                       <Icon className="w-4 h-4" />
                     </div>
-                    
+
                     <div className="flex-1 flex flex-col gap-1">
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex flex-wrap items-center gap-x-2 text-sm">
                           <span className="font-semibold text-foreground uppercase text-[10px] tracking-wider px-1.5 py-0.5 rounded border border-border bg-muted/50">
                             {config.label}
                           </span>
-                          <Link 
+                          <Link
                             href={`/contracts/${item.contract_id}`}
                             className="font-medium text-primary hover:underline flex items-center gap-1"
                           >
-                            {item.metadata?.name || formatShortenedText(item.contract_id, 10, '...')}
+                            {metadataName || formatShortenedText(item.contract_id, 10, '...')}
                             <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                           </Link>
-                          {item.metadata?.version && (
-                            <span className="text-muted-foreground">v{item.metadata.version}</span>
+                          {metadataVersion && (
+                            <span className="text-muted-foreground">v{metadataVersion}</span>
                           )}
                         </div>
                         <div className="flex items-center gap-1 text-xs text-muted-foreground whitespace-nowrap">
@@ -231,9 +238,10 @@ export default function ActivityFeed() {
                         )}
                       </div>
 
-                      {item.event_type === 'contract_updated' && item.metadata?.update_type && (
+                      {item.event_type === 'contract_updated' && metadataUpdateType && (
                         <div className="mt-1 text-xs px-2 py-1 rounded bg-muted/50 border border-border inline-block w-fit">
-                          <span className="font-medium">{t('activityFeed.type')}:</span> {item.metadata.update_type}
+                          <span className="font-medium">{t('activityFeed.type')}:</span>{' '}
+                          {metadataUpdateType}
                         </div>
                       )}
                     </div>

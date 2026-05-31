@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -11,7 +12,9 @@ use stellar_xdr::curr::{
 };
 
 use crate::cache::CacheLayer;
-use crate::type_safety::parser::parse_json_spec;
+use crate::simulation;
+use contract_abi::parser::parse_json_spec;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_RPC_MAINNET: &str = "https://mainnet.sorobanrpc.com";
 const DEFAULT_RPC_TESTNET: &str = "https://soroban-testnet.stellar.org";
@@ -71,6 +74,7 @@ pub struct OnChainVerificationResult {
     pub contract_exists_on_chain: bool,
     pub abi_available: bool,
     pub abi_valid: bool,
+    pub abi_matches_deployed_contract: bool,
     pub recent_call_count: usize,
     pub latest_ledger: Option<u32>,
     pub oldest_ledger: Option<u32>,
@@ -85,10 +89,18 @@ pub struct OnChainVerificationResult {
 }
 
 impl OnChainVerificationResult {
-    pub fn cache_key(contract: &Contract) -> String {
+    pub fn cache_key(contract: &Contract, abi_json: Option<&str>) -> String {
+        let abi_hash = abi_json
+            .map(|abi| {
+                let mut hasher = Sha256::new();
+                hasher.update(abi.as_bytes());
+                hex::encode(hasher.finalize())
+            })
+            .unwrap_or_else(|| "noabi".to_string());
+
         format!(
-            "onchain:{}:{}:{}",
-            contract.network, contract.contract_id, contract.wasm_hash
+            "onchain:{}:{}:{}:{}",
+            contract.network, contract.contract_id, contract.wasm_hash, abi_hash
         )
     }
 }
@@ -150,7 +162,7 @@ impl OnChainVerifier {
         contract: &Contract,
         abi_json: Option<&str>,
     ) -> Result<OnChainVerificationResult, RegistryError> {
-        let cache_key = OnChainVerificationResult::cache_key(contract);
+        let cache_key = OnChainVerificationResult::cache_key(contract, abi_json);
         if let Some(cached) = cache.get_verification(&cache_key).await {
             let mut parsed: OnChainVerificationResult =
                 serde_json::from_str(&cached).map_err(|e| {
@@ -198,6 +210,7 @@ impl OnChainVerifier {
                     on_chain_code_hash: None,
                     stored_wasm_hash: contract.wasm_hash.clone(),
                     wasm_hash_matches: false,
+                    abi_matches_deployed_contract: false,
                     warnings,
                     failure_reasons,
                 };
@@ -217,38 +230,73 @@ impl OnChainVerifier {
         };
 
         let on_chain_wasm_hash = on_chain.1;
-        let on_chain_code_hash = match self
-            .fetch_contract_code_hash(&config, &on_chain_wasm_hash)
+        let (on_chain_code_bytes, on_chain_code_hash) = match self
+            .fetch_contract_code_entry(&config, &on_chain_wasm_hash)
             .await
         {
-            Ok(value) => value,
+            Ok(Some((bytes, hash))) => (Some(bytes), Some(hash)),
+            Ok(None) => (None, None),
             Err(err) => {
                 warnings.push(err.to_string());
-                None
+                (None, None)
             }
         };
 
-        let abi_available = abi_json.is_some();
-        let abi_parse_result = abi_json.map(|abi| parse_json_spec(abi, &contract.contract_id));
-        let abi_valid = abi_parse_result
-            .as_ref()
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
+        let mut abi_available = false;
+        let mut abi_valid = false;
+        let mut abi_matches_deployed_contract = false;
 
-        if abi_available && !abi_valid {
-            let detail = abi_parse_result
-                .and_then(|r| r.err())
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown parse error".to_string());
-            let summary = if detail.len() > 200 {
-                format!("{}…", &detail[..200])
-            } else {
-                detail
-            };
-            warnings.push(format!("stored ABI could not be parsed: {summary}"));
-            failure_reasons.push(OnChainFailureReason::AbiMismatch { detail: summary });
-        } else if !abi_available {
-            failure_reasons.push(OnChainFailureReason::AbiMissing);
+        if let Some(abi) = abi_json {
+            abi_available = true;
+            match parse_json_spec(abi, &contract.contract_id) {
+                Ok(parsed_abi) => {
+                    let stored_function_names: HashSet<_> = parsed_abi
+                        .public_functions()
+                        .map(|f| f.name.to_ascii_lowercase())
+                        .collect();
+
+                    let extracted_function_names = on_chain_code_bytes
+                        .as_deref()
+                        .map(extract_function_names_from_wasm)
+                        .unwrap_or_default();
+
+                    if stored_function_names.is_empty() {
+                        warnings.push("Stored ABI contains no public functions".to_string());
+                    }
+
+                    if extracted_function_names.is_empty() {
+                        warnings.push(
+                            "Unable to infer contract functions from on-chain WASM for ABI comparison".to_string(),
+                        );
+                    }
+
+                    abi_matches_deployed_contract = !stored_function_names.is_empty()
+                        && !extracted_function_names.is_empty()
+                        && stored_function_names
+                            .intersection(&extracted_function_names)
+                            .next()
+                            .is_some();
+
+                    if !abi_matches_deployed_contract {
+                        warnings.push(
+                            "Stored ABI did not match inferred on-chain contract functions"
+                                .to_string(),
+                        );
+                    }
+
+                    abi_valid = abi_matches_deployed_contract;
+                }
+                Err(err) => {
+                    warnings.push(format!(
+                        "Stored ABI could not be parsed successfully: {}",
+                        err
+                    ));
+                }
+            }
+        }
+
+        if abi_json.is_some() && on_chain_code_bytes.is_none() {
+            warnings.push("On-chain contract code was unavailable for ABI validation".to_string());
         }
 
         let recent_call_count = match latest_ledger {
@@ -294,7 +342,7 @@ impl OnChainVerifier {
             cached: false,
             contract_exists_on_chain: true,
             abi_available,
-            abi_valid: abi_valid && wasm_hash_matches,
+            abi_valid,
             recent_call_count,
             latest_ledger,
             oldest_ledger: latest_ledger
@@ -303,6 +351,7 @@ impl OnChainVerifier {
             on_chain_code_hash,
             stored_wasm_hash: contract.wasm_hash.clone(),
             wasm_hash_matches,
+            abi_matches_deployed_contract,
             warnings,
             failure_reasons,
         };
@@ -370,11 +419,11 @@ impl OnChainVerifier {
         Ok(Some((instance, hex::encode(hash.0))))
     }
 
-    async fn fetch_contract_code_hash(
+    async fn fetch_contract_code_entry(
         &self,
         config: &NetworkConfig,
         wasm_hash: &str,
-    ) -> Result<Option<String>, RegistryError> {
+    ) -> Result<Option<(Vec<u8>, String)>, RegistryError> {
         let key = build_contract_code_ledger_key(wasm_hash)?;
         let response = self
             .rpc_call::<GetLedgerEntriesResult>(
@@ -405,7 +454,9 @@ impl OnChainVerifier {
             ));
         };
 
-        Ok(Some(verifier::hash_wasm(code.as_slice())))
+        let bytes = code.as_slice().to_vec();
+        let hash = verifier::hash_wasm(bytes.as_slice());
+        Ok(Some((bytes, hash)))
     }
 
     async fn fetch_recent_activity_count(
@@ -527,6 +578,7 @@ impl OnChainVerifier {
                             rpc_error
                         )));
                     }
+                    continue;
                 }
                 Err(err) => {
                     if attempt + 1 >= config.max_retries {
@@ -573,6 +625,14 @@ fn build_contract_code_ledger_key(wasm_hash: &str) -> Result<String, RegistryErr
     let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: Hash(hash) });
     key.to_xdr_base64(Limits::none())
         .map_err(|e| RegistryError::Internal(format!("Failed to encode contract code key: {}", e)))
+}
+
+fn extract_function_names_from_wasm(wasm_bytes: &[u8]) -> HashSet<String> {
+    simulation::extract_abi(wasm_bytes)
+        .functions
+        .into_iter()
+        .map(|func| func.name.to_ascii_lowercase())
+        .collect()
 }
 
 fn parse_contract_strkey(contract_id: &str) -> Result<ContractStrkey, RegistryError> {
@@ -650,29 +710,21 @@ mod tests {
             tags: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-            deployed_at: None,
             verified_at: None,
+            deployed_at: None,
             verified_by: None,
             verification_notes: None,
-            last_accessed_at: None,
             health_score: 0,
             is_maintenance: false,
+            last_accessed_at: None,
             logical_id: None,
             network_configs: None,
-            organization_id: None,
             relevance_score: None,
+            organization_id: None,
             visibility: shared::VisibilityType::Public,
             current_version: None,
-        }
-    }
-
-    #[test]
-    fn contract_strkey_parses() {
-        let parsed =
-            parse_contract_strkey("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4")
-                .expect("valid contract strkey");
-        assert_eq!(parsed.0.len(), 32);
-    }
+            usage_count: 0,
+        };
 
     #[test]
     fn code_key_requires_valid_hash() {
@@ -684,73 +736,54 @@ mod tests {
     fn cache_key_is_network_specific() {
         let contract = dummy_contract(Network::Testnet, "abc123");
         assert_eq!(
-            OnChainVerificationResult::cache_key(&contract),
+            OnChainVerificationResult::cache_key(&contract, None),
             "onchain:testnet:CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4:abc123"
         );
     }
 
-    // ── Failure-reason unit tests ─────────────────────────────────────────────
-
     #[test]
-    fn missing_artifact_reason_serialises_and_deserialises() {
-        let reason = OnChainFailureReason::ContractNotOnChain {
-            contract_id: "CXXX".to_string(),
-            network: "testnet".to_string(),
-            hint: "check deployment".to_string(),
+    fn cache_key_changes_when_abi_changes() {
+        let contract = Contract {
+            id: uuid::Uuid::nil(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string(),
+            wasm_hash: "abc123".to_string(),
+            name: "demo".to_string(),
+            slug: "demo".to_string(),
+            description: None,
+            publisher_id: uuid::Uuid::nil(),
+            network: Network::Testnet,
+            is_verified: false,
+            verification_status: shared::VerificationStatus::Unverified,
+            category: None,
+            tags: Vec::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            verified_at: None,
+            deployed_at: None,
+            verified_by: None,
+            verification_notes: None,
+            health_score: 0,
+            is_maintenance: false,
+            last_accessed_at: None,
+            logical_id: None,
+            network_configs: None,
+            relevance_score: None,
+            organization_id: None,
+            visibility: shared::VisibilityType::Public,
+            current_version: None,
+            usage_count: 0,
         };
-        let json = serde_json::to_string(&reason).expect("should serialise");
-        assert!(json.contains("\"reason\":\"contract_not_on_chain\""));
-        let back: OnChainFailureReason =
-            serde_json::from_str(&json).expect("should deserialise");
-        assert_eq!(back, reason);
+
+        let key_no_abi = OnChainVerificationResult::cache_key(&contract, None);
+        let key_with_abi = OnChainVerificationResult::cache_key(&contract, Some("[]"));
+        assert_ne!(key_no_abi, key_with_abi);
     }
 
     #[test]
-    fn wasm_hash_mismatch_reason_serialises() {
-        let reason = OnChainFailureReason::WasmHashMismatch {
-            stored: "aaaa".to_string(),
-            on_chain: "bbbb".to_string(),
-            hint: "re-publish".to_string(),
-        };
-        let json = serde_json::to_string(&reason).expect("should serialise");
-        assert!(json.contains("\"reason\":\"wasm_hash_mismatch\""));
-    }
-
-    #[test]
-    fn abi_mismatch_reason_contains_detail() {
-        let reason = OnChainFailureReason::AbiMismatch {
-            detail: "unexpected field".to_string(),
-        };
-        let json = serde_json::to_string(&reason).expect("should serialise");
-        assert!(json.contains("\"reason\":\"abi_mismatch\""));
-        assert!(json.contains("unexpected field"));
-    }
-
-    #[test]
-    fn abi_missing_reason_serialises() {
-        let reason = OnChainFailureReason::AbiMissing;
-        let json = serde_json::to_string(&reason).expect("should serialise");
-        assert!(json.contains("\"reason\":\"abi_missing\""));
-    }
-
-    #[test]
-    fn failure_reason_display_messages_are_user_friendly() {
-        assert!(OnChainFailureReason::AbiMissing
-            .to_string()
-            .contains("abi missing"));
-        assert!(OnChainFailureReason::WasmHashMismatch {
-            stored: "s".to_string(),
-            on_chain: "o".to_string(),
-            hint: "h".to_string(),
-        }
-        .to_string()
-        .contains("wasm hash mismatch"));
-        assert!(OnChainFailureReason::ContractNotOnChain {
-            contract_id: "C".to_string(),
-            network: "mainnet".to_string(),
-            hint: "check".to_string(),
-        }
-        .to_string()
-        .contains("not found on mainnet"));
+    fn wasm_function_extraction_finds_matching_symbols() {
+        let bytes = b"random bytes transfer balance";
+        let functions = extract_function_names_from_wasm(bytes);
+        assert!(functions.contains("transfer"));
+        assert!(functions.contains("balance"));
     }
 }

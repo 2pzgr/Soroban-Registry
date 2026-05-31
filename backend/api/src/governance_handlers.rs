@@ -1,3 +1,4 @@
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -12,7 +13,9 @@ use crate::{
     state::AppState,
 };
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "governance_model", rename_all = "snake_case")]
 pub enum GovernanceModel {
@@ -22,7 +25,9 @@ pub enum GovernanceModel {
     Timelock,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "governance_proposal_status", rename_all = "snake_case")]
 pub enum GovernanceProposalStatus {
@@ -34,7 +39,9 @@ pub enum GovernanceProposalStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type, utoipa::ToSchema,
+)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "vote_choice", rename_all = "lowercase")]
 pub enum VoteChoice {
@@ -53,7 +60,7 @@ impl VoteChoice {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateProposalRequest {
     pub contract_id: Uuid,
     pub title: String,
@@ -67,28 +74,28 @@ pub struct CreateProposalRequest {
     pub approval_threshold: Option<i32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CastVoteRequest {
     pub voter: Uuid,
     pub vote_choice: VoteChoice,
     pub delegated_from: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpsertVotingRightsRequest {
     pub publisher_id: Uuid,
     pub voting_power: i64,
     pub source: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct ListProposalsQuery {
     pub status: Option<String>,
     pub contract_id: Option<Uuid>,
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, utoipa::ToSchema)]
 pub struct GovernanceProposal {
     pub id: Uuid,
     pub contract_id: Uuid,
@@ -106,7 +113,7 @@ pub struct GovernanceProposal {
     pub executed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, utoipa::ToSchema)]
 pub struct GovernanceVote {
     pub id: Uuid,
     pub proposal_id: Uuid,
@@ -117,7 +124,7 @@ pub struct GovernanceVote {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, utoipa::ToSchema)]
 pub struct GovernanceVotingRight {
     pub id: Uuid,
     pub contract_id: Uuid,
@@ -129,7 +136,7 @@ pub struct GovernanceVotingRight {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct GovernanceVoteTally {
     pub proposal_id: Uuid,
     pub votes_for: i64,
@@ -143,7 +150,7 @@ pub struct GovernanceVoteTally {
     pub status: GovernanceProposalStatus,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ExecuteProposalResponse {
     pub proposal_id: Uuid,
     pub status: GovernanceProposalStatus,
@@ -175,7 +182,7 @@ fn parse_status_filter(status: Option<&str>) -> ApiResult<Option<GovernancePropo
         Some("rejected") => Ok(Some(GovernanceProposalStatus::Rejected)),
         Some("executed") => Ok(Some(GovernanceProposalStatus::Executed)),
         Some("cancelled") => Ok(Some(GovernanceProposalStatus::Cancelled)),
-        Some(_) => Err(ApiError::bad_request(
+        Some(_) => Err(ApiError::bad_request_with(
             "InvalidStatus",
             "status must be one of: pending, active, passed, rejected, executed, cancelled",
         )),
@@ -289,7 +296,7 @@ async fn evaluate_proposal_status(
 )]
 pub async fn create_proposal(
     State(state): State<AppState>,
-    Json(payload): Json<CreateProposalRequest>,
+    ValidatedJson(payload): ValidatedJson<CreateProposalRequest>,
 ) -> ApiResult<Json<GovernanceProposal>> {
     if payload.title.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -460,7 +467,7 @@ pub async fn get_proposal(
 pub async fn cast_vote(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<CastVoteRequest>,
+    ValidatedJson(payload): ValidatedJson<CastVoteRequest>,
 ) -> ApiResult<Json<GovernanceVote>> {
     let proposal_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request("InvalidProposalId", "proposal id must be a UUID"))?;
@@ -735,7 +742,7 @@ pub async fn list_voting_rights(
 pub async fn upsert_voting_rights(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<UpsertVotingRightsRequest>,
+    ValidatedJson(payload): ValidatedJson<UpsertVotingRightsRequest>,
 ) -> ApiResult<Json<GovernanceVotingRight>> {
     let contract_id = Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request("InvalidContractId", "contract id must be a UUID"))?;

@@ -1,98 +1,38 @@
 #![warn(unused_imports)]
 
-mod ab_test_handlers;
-mod aggregation;
-mod analytics;
-mod auth;
-mod auth_handlers;
-mod batch_verify_handlers;
-mod breaking_changes;
-mod cache;
-mod canary_handlers;
-mod compatibility_testing_handlers;
-mod contract_events;
-mod contributor_handlers;
-mod db_monitoring;
-mod governance_handlers;
-mod graphql;
-mod interoperability;
-mod interoperability_handlers;
-
-mod activity_feed_handlers;
-mod activity_feed_routes;
-mod analytics_handlers;
-mod category_handlers;
-mod custom_metrics_handlers;
-mod dependency;
-mod dependency_handlers;
-mod deprecation_handlers;
-mod error;
-mod events;
-mod favorites_handlers;
-mod handlers;
-mod health;
-pub mod health_monitor;
-#[cfg(test)]
-mod health_tests;
-mod incident_handlers;
-mod incident_routes;
-mod metrics;
-mod metrics_handler;
-mod migration_handlers;
-mod models;
-mod multisig_handlers;
-mod multisig_routes;
-mod mutation_testing_handlers; // Issue #619
-mod onchain_verification;
-#[cfg(feature = "openapi")]
-mod openapi;
-mod org_handlers;
-mod patch_handlers;
-mod plugin_marketplace_handlers;
-mod performance_handlers;
-mod rate_limit;
-mod recommendation_handlers;
-mod release_notes_handlers;
-mod release_notes_routes;
-pub mod request_tracing;
-mod resource_handlers;
-mod resource_tracking;
-mod routes;
-pub mod security_log;
-pub mod signing_handlers;
-mod similarity_handlers;
-mod simulation;
-mod simulation_handlers;
-mod state;
-
-mod clone_federation_handlers;
-mod formal_verification;
-mod formal_verification_handlers;
-mod graph_analysis;
-mod graph_analysis_handlers;
-mod pagination;
-mod gas_estimation_handlers;
-mod security_scan_handlers;
-mod subscription_handlers;
-mod type_safety;
-mod validation;
-mod webhook_delivery;
-mod websocket;
-mod verification_handlers;
-mod zk_proof_handlers;
-
 use anyhow::Result;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::Response;
-use axum::{middleware, Router};
-use dotenv::dotenv;
 use prometheus::Registry;
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use std::time::Duration;
+use tokio::sync::broadcast;
+use tracing::{error, info, warn};
+
+use api::aggregation;
+use api::ai::service::AIService;
+use api::config;
+use api::db_monitoring;
+use api::error::ApiError;
+use api::graphql;
+use api::handlers;
+use api::health_monitor;
+use api::metrics;
+use api::migration_handlers;
+use api::rate_limit;
+use api::rate_limit::RateLimitState;
+use api::request_tracing;
+use api::routes;
+use api::security::WebSecurityConfig;
+use api::state::AppState;
+use api::state_monitor::StateMonitorService;
+use api::validation;
+use api::webhook_delivery;
 
 async fn track_in_flight_middleware(
     State(state): State<AppState>,
@@ -106,49 +46,28 @@ async fn track_in_flight_middleware(
             "Service is shutting down and temporarily unavailable",
         ));
     }
-    crate::metrics::HTTP_IN_FLIGHT.inc();
+    metrics::HTTP_IN_FLIGHT.inc();
     let res = next.run(req).await;
-    crate::metrics::HTTP_IN_FLIGHT.dec();
+    metrics::HTTP_IN_FLIGHT.dec();
     Ok(res)
 }
 
-use crate::error::ApiError;
-use crate::rate_limit::RateLimitState;
-use crate::state::AppState;
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables
-    dotenv().ok();
+    // Load and validate configuration (#768)
+    let config = config::load_config()?;
 
     // Initialize structured JSON tracing (ELK/Splunk compatible)
     request_tracing::init_json_tracing();
-
-    // Fail fast on startup when JWT configuration is invalid.
-    if let Err(err) = auth::AuthManager::from_env() {
-        tracing::error!(
-            error = %err,
-            "JWT authentication configuration is invalid. Set JWT_SECRET to a strong value with at least {} characters.",
-            auth::MIN_JWT_SECRET_LEN
-        );
-        return Err(anyhow::anyhow!(
-            "Invalid JWT authentication configuration: {}",
-            err
-        ));
-    }
-
-    // Database connection with dynamic pool size
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let logical_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
 
-    let default_max_pool = (logical_cores * 2).max(10);
     let max_pool_size = std::env::var("DB_MAX_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(default_max_pool as u32);
+        .unwrap_or((logical_cores * 2).max(10) as u32);
 
     tracing::info!(
         max_pool_size = max_pool_size,
@@ -159,7 +78,11 @@ async fn main() -> Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(max_pool_size)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&database_url)
+        .connect_with(
+            config
+                .database_url
+                .parse::<sqlx::postgres::PgConnectOptions>()?,
+        )
         .await?;
 
     // Run migrations (skip if SKIP_MIGRATIONS=true, useful when migrations were applied manually)
@@ -183,9 +106,15 @@ async fn main() -> Result<()> {
     // Spawn the hourly analytics aggregation background task
     aggregation::spawn_aggregation_task(pool.clone());
 
+    // Spawn the periodic data integrity verification task (Issue #886)
+    api::integrity::spawn_integrity_verification_task(pool.clone());
+
+    // Spawn the query-analysis flush + N+1 persistence task (Issue #887)
+    api::query_analysis::spawn_query_analysis_task(pool.clone());
+
     // Create prometheus registry for metrics
     let registry = Registry::new();
-    if let Err(e) = crate::metrics::register_all(&registry) {
+    if let Err(e) = api::metrics::register_all(&registry) {
         tracing::error!("Failed to register metrics: {}", e);
     }
 
@@ -193,6 +122,81 @@ async fn main() -> Result<()> {
     // let (job_engine, job_rx) = soroban_batch::engine::JobEngine::new();
     // let job_engine = Arc::new(job_engine);
     // tokio::spawn(async move { job_engine.clone().run_worker(job_rx).await });
+
+    // Issue #727: create rate limiter before AppState so it can be shared
+    let rate_limit_state = std::sync::Arc::new(RateLimitState::from_env());
+    rate_limit_state.spawn_eviction_task();
+
+    // Initialize AI service (optional - graceful if not configured)
+    let ai_service = match AIService::from_env() {
+        Ok(service) => {
+            tracing::info!("AI service initialized successfully");
+            Some(Arc::new(service))
+        }
+        Err(e) => {
+            tracing::warn!("AI service not initialized: {}", e);
+            None
+        }
+    };
+
+    // Create event broadcaster for real-time updates
+    let (event_broadcaster, _) = broadcast::channel(100);
+
+    // Database Concurrency & Queue configuration (#595)
+    let concurrency_limit = std::env::var("DB_CONCURRENCY_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(((max_pool_size as usize).saturating_sub(2)).max(1));
+
+    let queue_limit = std::env::var("DB_QUEUE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50);
+
+    let queue_timeout_ms = std::env::var("DB_QUEUE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5000);
+
+    let breaker_failures = std::env::var("CIRCUIT_BREAKER_FAILURES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(5);
+
+    let breaker_recovery_secs = std::env::var("CIRCUIT_BREAKER_RECOVERY_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    tracing::info!(
+        concurrency_limit = concurrency_limit,
+        queue_limit = queue_limit,
+        queue_timeout_ms = queue_timeout_ms,
+        breaker_failures = breaker_failures,
+        breaker_recovery_secs = breaker_recovery_secs,
+        "Initializing database resilience layer"
+    );
+
+    let db_breaker = Arc::new(api::db_resilience::CircuitBreaker::new(
+        breaker_failures,
+        Duration::from_secs(breaker_recovery_secs),
+    ));
+
+    let db_queue = Arc::new(api::db_resilience::DbQueue::new(
+        concurrency_limit,
+        queue_limit,
+        Duration::from_millis(queue_timeout_ms),
+    ));
+
+    // Spawn background database health ping task
+    api::db_resilience::spawn_background_ping_task(
+        pool.clone(),
+        db_breaker.clone(),
+        Duration::from_secs(2), // Ping every 2 seconds
+        Duration::from_secs(1), // Timeout after 1 second
+    );
+    // Initialize feature flags manager
+    let feature_flags = Arc::new(api::feature_flags::FeatureFlagManager::new());
 
     // Create app state
     let is_shutting_down = Arc::new(AtomicBool::new(false));
@@ -202,7 +206,52 @@ async fn main() -> Result<()> {
     let je = job_engine.clone();
     tokio::spawn(async move { je.run_worker(job_rx).await });
 
-    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone()).await?;
+    let mut state = AppState::new(
+        pool.clone(),
+        registry,
+        job_engine,
+        is_shutting_down.clone(),
+        rate_limit_state.clone(),
+        ai_service.clone(),
+        event_broadcaster.clone(),
+        db_breaker,
+        db_queue,
+        feature_flags,
+    )
+    .await?;
+
+    // Initialize state monitor service (optional)
+    if let Some(monitor) = state.state_monitor.clone() {
+        // Spawn state monitor background task
+        tokio::spawn(async move {
+            if let Err(e) = monitor.run().await {
+                tracing::error!("State monitor error: {}", e);
+            }
+        });
+    }
+
+    // Initialize state monitor service (optional)
+    let _state_monitor = match StateMonitorService::new(pool.clone(), event_broadcaster.clone()) {
+        Ok(service) => {
+            info!("State monitor service initialized");
+            let monitor = Arc::new(service);
+            state.state_monitor = Some(monitor.clone());
+
+            // Spawn state monitor background task
+            let monitor_clone = monitor.clone();
+            tokio::spawn(async move {
+                if let Err(e) = monitor_clone.run().await {
+                    error!("State monitor error: {}", e);
+                }
+            });
+
+            Some(monitor)
+        }
+        Err(e) => {
+            warn!("State monitor service not initialized: {}", e);
+            None
+        }
+    };
 
     // Initialize GraphQL schema
     let schema = graphql::schema::build_schema(state.clone());
@@ -220,6 +269,10 @@ async fn main() -> Result<()> {
         health_monitor::run_health_monitor(hm_state, hm_status).await;
     });
 
+    // Create alert manager and spawn system health monitor
+    let alert_mgr = Arc::new(api::alerting::AlertManager::new());
+    api::system_health::spawn_system_health_monitor(pool.clone(), state.cache.clone(), alert_mgr);
+
     let network_state = state.clone();
     tokio::spawn(async move {
         handlers::run_network_catalog_refresh(network_state).await;
@@ -228,86 +281,11 @@ async fn main() -> Result<()> {
     // Warm up the cache
     state.cache.clone().warm_up(pool.clone());
 
-    let rate_limit_state = RateLimitState::from_env();
-    rate_limit_state.spawn_eviction_task();
-
-    let allowed_origins = std::env::var("ALLOWED_ORIGINS").unwrap_or_else(|_| {
-        "http://localhost:3000,https://soroban-registry.vercel.app".to_string()
-    });
-
-    let origins: Vec<HeaderValue> = allowed_origins
-        .split(',')
-        .filter_map(|s| {
-            let s = s.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(HeaderValue::from_str(s).expect("Invalid allowed origin"))
-            }
-        })
-        .collect();
-
-    let cors = CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            crate::request_tracing::X_REQUEST_ID.clone(),
-            crate::request_tracing::X_CORRELATION_ID.clone(),
-        ])
-        .expose_headers([
-            crate::request_tracing::X_REQUEST_ID.clone(),
-            crate::request_tracing::X_CORRELATION_ID.clone(),
-        ]);
+    let web_security = WebSecurityConfig::from_env();
+    let cors = web_security.build_cors_layer();
 
     // Build router
-    let app = Router::new()
-        .merge(routes::auth_routes())
-        .merge(routes::plugin_routes())
-        .merge(routes::organization_routes())
-        .merge(routes::contract_routes())
-        .merge(routes::publisher_routes())
-        .merge(routes::contributor_routes())
-        .merge(routes::health_routes())
-        .merge(routes::migration_routes())
-        .merge(incident_routes::incident_routes())
-        .merge(routes::network_routes())
-        .merge(routes::openapi_routes())
-        .merge(routes::health_monitor_routes())
-        .merge(routes::admin_routes())
-        .merge(routes::category_routes())
-        .merge(routes::compatibility_dashboard_routes())
-        .merge(routes::governance_routes())
-        .merge(routes::canary_routes())
-        .merge(routes::ab_test_routes())
-        .merge(routes::performance_routes())
-        .merge(routes::federation_routes())
-        .merge(routes::mutation_testing_routes()) // Issue #619
-        .merge(multisig_routes::routes())
-        .merge(routes::observability_routes())
-        .merge(routes::websocket_routes())
-        .merge(routes::subscription_routes())
-        .merge(routes::graph_analysis_routes())
-        .merge(routes::formal_verification_routes())
-        .merge(routes::verification_status_routes())
-        .merge(routes::validator_routes())
-        .merge(release_notes_routes::release_notes_routes())
-        .route(
-            "/api/graphql",
-            axum::routing::post(graphql::graphql_handler).with_state(schema),
-        )
-        .route(
-            "/api/graphql/playground",
-            axum::routing::get(graphql::graphql_playground),
-        )
-        .nest("/api", activity_feed_routes::routes())
+    let app = routes::application_routes(schema)
         .fallback(handlers::route_not_found)
         .layer(middleware::from_fn(
             validation::payload_size::payload_size_validation_middleware,
@@ -317,11 +295,19 @@ async fn main() -> Result<()> {
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            api::db_resilience::db_resilience_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             track_in_flight_middleware,
         ))
         .layer(middleware::from_fn_with_state(
-            rate_limit_state,
+            (*rate_limit_state).clone(),
             rate_limit::rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            web_security,
+            api::security::csrf_and_origin_middleware,
         ))
         .layer(cors)
         .layer(middleware::from_fn(request_tracing::tracing_middleware))
@@ -379,7 +365,7 @@ async fn main() -> Result<()> {
 
     if let Some(()) = rx.recv().await {
         is_shutting_down.store(true, Ordering::SeqCst);
-        let initial_in_flight = crate::metrics::HTTP_IN_FLIGHT.get();
+        let initial_in_flight = metrics::HTTP_IN_FLIGHT.get();
         tracing::info!(
             "Graceful shutdown initiated. In-flight requests: {}",
             initial_in_flight
@@ -395,7 +381,7 @@ async fn main() -> Result<()> {
 
         let mut success = false;
         loop {
-            let in_flight = crate::metrics::HTTP_IN_FLIGHT.get();
+            let in_flight = metrics::HTTP_IN_FLIGHT.get();
             if in_flight == 0 {
                 tracing::info!(
                     "All in-flight requests completed in {}ms. In-flight: 0",

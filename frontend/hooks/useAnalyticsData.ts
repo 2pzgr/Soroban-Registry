@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
-import { fetchAnalytics } from '@/lib/api/analytics';
-import { AnalyticsResponse, TimePeriod } from '@/types/analytics';
+import { useState, useEffect, useCallback } from "react";
+import { fetchAnalytics } from "@/lib/api/analytics";
+import type { AnalyticsResponse, TimePeriod } from "@/types";
 
 interface UseAnalyticsDataReturn {
   data: AnalyticsResponse | null;
@@ -21,17 +21,23 @@ export function useAnalyticsData(period: TimePeriod): UseAnalyticsDataReturn {
       const result = await fetchAnalytics(period);
       setData(result);
     } catch (err) {
-      setError(err instanceof Error ? err : new Error('Failed to fetch analytics'));
+      setError(
+        err instanceof Error ? err : new Error("Failed to fetch analytics"),
+      );
     } finally {
       setLoading(false);
     }
   }, [period]);
 
   useEffect(() => {
-    loadData();
+    requestAnimationFrame(() => void loadData());
 
     const intervalId = setInterval(() => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState === "hidden"
+      )
+        return;
       fetchAnalytics(period)
         .then(setData)
         .catch(() => {});

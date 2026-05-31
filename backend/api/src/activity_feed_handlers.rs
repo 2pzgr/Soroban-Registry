@@ -1,3 +1,4 @@
+use crate::error::ApiError;
 use crate::error::ApiResult;
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -27,7 +28,7 @@ pub async fn get_activity_feed(
         query_builder.push_bind(cursor);
     }
 
-    if let Some(event_type) = params.event_type {
+    if let Some(ref event_type) = params.event_type {
         query_builder.push(" AND event_type = ");
         query_builder.push_bind(event_type);
     }
@@ -44,14 +45,13 @@ pub async fn get_activity_feed(
         .build_query_as()
         .fetch_all(&state.db)
         .await
-        .map_err(|e| crate::error::db_err("fetch activity feed", e))?;
+        .map_err(|e| ApiError::internal(format!("fetch activity feed failed: {}", e)))?;
 
     // 2. Count total matches for this filter
-    let mut count_builder: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-        "SELECT COUNT(*) FROM analytics_events WHERE 1=1",
-    );
+    let mut count_builder: QueryBuilder<sqlx::Postgres> =
+        QueryBuilder::new("SELECT COUNT(*) FROM analytics_events WHERE 1=1");
 
-    if let Some(event_type) = params.event_type {
+    if let Some(ref event_type) = params.event_type {
         count_builder.push(" AND event_type = ");
         count_builder.push_bind(event_type);
     }
@@ -65,7 +65,7 @@ pub async fn get_activity_feed(
         .build_query_scalar()
         .fetch_one(&state.db)
         .await
-        .map_err(|e| crate::error::db_err("count activity feed", e))?;
+        .map_err(|e| ApiError::internal(format!("count activity feed failed: {}", e)))?;
 
     let next_cursor = events.last().map(|e| e.created_at);
 

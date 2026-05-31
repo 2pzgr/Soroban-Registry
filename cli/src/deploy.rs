@@ -1,9 +1,9 @@
+use crate::wizard::{confirm, detect_soroban, mask_secret, prompt, prompt_with_validation};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
-use crate::wizard::{prompt, prompt_with_validation, confirm, mask_secret, detect_soroban};
 
 pub async fn run_interactive() -> Result<()> {
     println!("\n{}", "🚀 Interactive Contract Deployment".bold().cyan());
@@ -62,10 +62,21 @@ pub async fn run_interactive() -> Result<()> {
     println!("\n{}", "Deployment Preview".bold().cyan());
     println!("{}", "-".repeat(80).cyan());
     println!("{}: {}", "WASM".bold(), wasm_path.bright_black());
-    println!("{}: {}", "Network".bold(), network.to_lowercase().bright_blue());
-    println!("{}: {}", "Signer".bold(), mask_secret(&signer).bright_black());
+    println!(
+        "{}: {}",
+        "Network".bold(),
+        network.to_lowercase().bright_blue()
+    );
+    println!(
+        "{}: {}",
+        "Signer".bold(),
+        mask_secret(&signer).bright_black()
+    );
     println!("{}:", "Params".bold());
-    println!("{}", serde_json::to_string_pretty(&params_value).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&params_value).unwrap_or_default()
+    );
     println!("{}", "-".repeat(80).cyan());
 
     if !confirm("Proceed with deployment? [y/N]", false)? {
@@ -76,7 +87,10 @@ pub async fn run_interactive() -> Result<()> {
     // 6. Execution
     let soroban_available = detect_soroban();
     if !soroban_available {
-        println!("{}", "⚠ soroban CLI not found. Performing simulated deployment only.".yellow());
+        println!(
+            "{}",
+            "⚠ soroban CLI not found. Performing simulated deployment only.".yellow()
+        );
         simulate_deployment(&wasm_path, &network, &signer, &params_value)?;
     } else {
         execute_deployment(&wasm_path, &network, &signer, &params_value)?;
@@ -85,53 +99,39 @@ pub async fn run_interactive() -> Result<()> {
     Ok(())
 }
 
-fn simulate_deployment(wasm: &str, network: &str, signer: &str, params: &serde_json::Value) -> Result<()> {
+fn simulate_deployment(
+    wasm: &str,
+    network: &str,
+    signer: &str,
+    params: &serde_json::Value,
+) -> Result<()> {
     println!("{}", "Simulating deployment...".bright_black());
     std::thread::sleep(std::time::Duration::from_secs(1));
     println!("{}", "✓ Simulation successful!".green());
-    println!("{}: {}", "Contract ID (Simulated)".bold(), "C...SIMULATED...123");
+    println!(
+        "{}: {}",
+        "Contract ID (Simulated)".bold(),
+        "C...SIMULATED...123"
+    );
     Ok(())
 }
 
-fn execute_deployment(wasm: &str, network: &str, signer: &str, params: &serde_json::Value) -> Result<()> {
-    println!("{}", "Executing deployment via soroban CLI...".bright_black());
-    
+pub fn deploy_to_network(
+    wasm: &str,
+    network: &str,
+    signer: &str,
+) -> Result<String> {
     let mut args = vec![
-        "contract", "deploy",
-        "--wasm", wasm,
-        "--network", network,
-        "--source", signer,
+        "contract",
+        "deploy",
+        "--wasm",
+        wasm,
+        "--network",
+        network,
+        "--source",
+        signer,
     ];
 
-    // If there are params, we'd ideally pass them here. 
-    // Soroban CLI usually takes --wasm-hash if installing separately, 
-    // or --id if deploying. 
-    // Note: This is a simplified execution.
-    
-    let mut args = vec![
-        "contract", "deploy",
-        "--wasm", wasm,
-        "--network", network,
-        "--source", signer,
-    ];
-
-    // Convert JSON params to Stellar CLI argument syntax: -- arg1 val1 arg2 val2
-    let mut constructor_args = Vec::new();
-    if let Some(obj) = params.as_object() {
-        if !obj.is_empty() {
-            args.push("--");
-            for (key, value) in obj {
-                constructor_args.push(format!("--{}", key));
-                constructor_args.push(value.as_str().unwrap_or(&value.to_string()).to_string());
-            }
-        }
-    }
-
-    for arg in &constructor_args {
-        args.push(arg);
-    }
-
-    // Try 'stellar' first, fall back to 'soroban'
     let cmd_name = if Command::new("stellar").arg("--version").output().is_ok() {
         "stellar"
     } else {
@@ -145,11 +145,30 @@ fn execute_deployment(wasm: &str, network: &str, signer: &str, params: &serde_js
 
     if output.status.success() {
         let contract_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("{} {}", "✓ Deployment successful!".green().bold(), contract_id);
+        Ok(contract_id)
     } else {
         let error = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("Deployment failed: {}", error);
     }
+}
+
+fn execute_deployment(
+    wasm: &str,
+    network: &str,
+    signer: &str,
+    _params: &serde_json::Value,
+) -> Result<()> {
+    println!(
+        "{}",
+        "Executing deployment via soroban CLI...".bright_black()
+    );
+
+    let contract_id = deploy_to_network(wasm, network, signer)?;
+    println!(
+        "{} {}",
+        "✓ Deployment successful!".green().bold(),
+        contract_id
+    );
 
     Ok(())
 }

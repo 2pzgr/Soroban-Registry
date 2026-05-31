@@ -1,3 +1,5 @@
+use crate::validation::extractors::ValidatedJson;
+use crate::validation::handler_requests::ValidatedJsonBody;
 use axum::{
     extract::{Json, Path, Query, State},
     http::StatusCode,
@@ -126,7 +128,7 @@ struct ComparisonRow {
 pub async fn record_metric(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
-    Json(req): Json<RecordPerformanceMetricRequest>,
+    ValidatedJson(req): ValidatedJson<RecordPerformanceMetricRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let contract_uuid = parse_uuid(&contract_id, "contract")?;
 
@@ -166,7 +168,7 @@ pub async fn record_metric(
 pub async fn record_benchmark(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
-    Json(req): Json<RecordPerformanceBenchmarkRequest>,
+    ValidatedJson(req): ValidatedJson<RecordPerformanceBenchmarkRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let contract_uuid = parse_uuid(&contract_id, "contract")?;
     let version_uuid = req
@@ -450,7 +452,7 @@ pub async fn list_alerts(
 pub async fn acknowledge_alert(
     State(state): State<AppState>,
     Path(alert_id): Path<String>,
-    Json(body): Json<Value>,
+    ValidatedJson(body): ValidatedJson<ValidatedJsonBody>,
 ) -> ApiResult<Json<PerformanceAlert>> {
     let alert_uuid = parse_uuid(&alert_id, "alert")?;
     let acknowledged_by = body
@@ -515,7 +517,7 @@ pub async fn resolve_alert(
 pub async fn create_alert_config(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
-    Json(req): Json<CreateAlertConfigRequest>,
+    ValidatedJson(req): ValidatedJson<CreateAlertConfigRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let contract_uuid = parse_uuid(&contract_id, "contract")?;
 
@@ -617,7 +619,7 @@ pub async fn get_performance_summary(
     Path(contract_id): Path<String>,
 ) -> ApiResult<Json<ContractPerformanceSummaryResponse>> {
     let contract_uuid = parse_uuid(&contract_id, "contract")?;
-    let summary = build_performance_summary(&state, contract_uuid).await?;
+    let summary = build_performance_summary_internal(&state, contract_uuid).await?;
     Ok(Json(summary))
 }
 
@@ -872,13 +874,13 @@ pub(crate) async fn build_performance_summary_internal(
             .into_iter()
             .map(metric_snapshot_from_row)
             .collect(),
-        trend_points: trend_rows.into_iter().map(trend_from_row).collect(),
+        trends: trend_rows.into_iter().map(trend_from_row).collect(),
         regressions: regression_rows
             .into_iter()
             .map(regression_from_row)
             .collect(),
-        recent_anomalies: Vec::new(),
-        recent_alerts: unresolved_alerts,
+        comparisons: Vec::new(),
+        unresolved_alerts,
     })
 }
 
@@ -995,7 +997,7 @@ fn decimal_from_f64(value: f64) -> Decimal {
 
 fn parse_uuid(id: &str, label: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(id).map_err(|_| {
-        ApiError::bad_request("InvalidId", format!("Invalid {} ID format: {}", label, id))
+        ApiError::bad_request_with("InvalidId", format!("Invalid {} ID format: {}", label, id))
     })
 }
 

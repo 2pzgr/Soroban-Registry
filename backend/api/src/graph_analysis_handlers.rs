@@ -22,8 +22,7 @@ use crate::{
     state::AppState,
 };
 use shared::{
-    CriticalContractScore, GraphAnalysisReport, GraphCluster, IssueSeverity,
-    VulnerabilityPropagationResult,
+    CriticalContractScore, GraphAnalysisReport, IssueSeverity, VulnerabilityPropagationResult,
 };
 
 // ─── Query params ─────────────────────────────────────────────────────────────
@@ -58,7 +57,9 @@ const ANALYSIS_CACHE_TTL_SECS: u64 = 600; // 10 minutes
 fn analysis_cache_key(network: Option<&shared::Network>) -> String {
     format!(
         "graph_analysis:{}",
-        network.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string())
+        network
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "all".to_string())
     )
 }
 
@@ -131,7 +132,8 @@ pub async fn get_critical_contracts(
     Query(query): Query<CriticalContractsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let report = build_report(&state, query.network, false).await?;
+    let network = query.network.clone();
+    let report = build_report(&state, network.clone(), false).await?;
 
     let top: Vec<&CriticalContractScore> = report.critical_contracts.iter().take(limit).collect();
 
@@ -213,8 +215,7 @@ pub async fn get_vulnerability_propagation(
         )
     })?;
 
-    let result =
-        graph_analysis::propagate_vulnerability(&g, &[(source_idx, effective_severity)]);
+    let result = graph_analysis::propagate_vulnerability(&g, &[(source_idx, effective_severity)]);
 
     Ok(Json(result))
 }
@@ -226,7 +227,8 @@ pub async fn get_subnetwork(
     Path(cluster_id): Path<usize>,
     Query(query): Query<GraphAnalysisQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let report = build_report(&state, query.network, false).await?;
+    let network = query.network.clone();
+    let report = build_report(&state, network.clone(), false).await?;
 
     let cluster = report
         .clusters
@@ -246,7 +248,7 @@ pub async fn get_subnetwork(
     // Cross-network edges within this cluster.
     let member_set: std::collections::HashSet<Uuid> = members.iter().copied().collect();
 
-    let graph = dependency::build_dependency_graph(&state.db, query.network)
+    let graph = dependency::build_dependency_graph(&state.db, network)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to build graph: {}", e)))?;
 

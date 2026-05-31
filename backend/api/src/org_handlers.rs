@@ -1,15 +1,20 @@
-use crate::{auth::AuthClaims, error::ApiResult, handlers::db_internal_error, state::AppState};
+use crate::validation::extractors::ValidatedJson;
+use crate::{
+    auth::AuthClaims,
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
 use chrono::Utc;
-use chrono::Utc;
 use shared::{
     CreateOrganizationRequest, InviteMemberRequest, Organization, OrganizationMember,
     OrganizationRole, UpdateOrganizationRequest,
 };
+use sqlx::postgres::PgRow;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -21,7 +26,7 @@ fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
 pub async fn create_organization(
     State(state): State<AppState>,
     claims: AuthClaims,
-    Json(payload): Json<CreateOrganizationRequest>,
+    ValidatedJson(payload): ValidatedJson<CreateOrganizationRequest>,
 ) -> ApiResult<(StatusCode, Json<Organization>)> {
     let mut tx = state
         .db
@@ -69,7 +74,7 @@ pub async fn create_organization(
 
     tx.commit()
         .await
-        .map_err(|e| db_internal_error("commit_transaction", e))?;
+        .map_err::<crate::error::ApiError, _>(|e| db_internal_error("commit_transaction", e))?;
 
     Ok((StatusCode::CREATED, Json(org)))
 }
@@ -116,7 +121,7 @@ pub async fn update_organization(
     State(state): State<AppState>,
     claims: AuthClaims,
     Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateOrganizationRequest>,
+    ValidatedJson(payload): ValidatedJson<UpdateOrganizationRequest>,
 ) -> ApiResult<Json<Organization>> {
     // Check if user is Admin of the org
     check_org_role(&state.db, id, &claims.sub, OrganizationRole::Admin).await?;
@@ -133,8 +138,8 @@ pub async fn update_organization(
         RETURNING *
         "#,
     )
-    .bind(payload.name)
-    .bind(payload.description)
+    .bind(&payload.name)
+    .bind(&payload.description)
     .bind(payload.is_private)
     .bind(id)
     .fetch_one(&state.db)
@@ -167,7 +172,7 @@ pub async fn check_org_role(
 
     let role = member_row.ok_or(StatusCode::FORBIDDEN)?.0;
 
-    let has_access = match (min_role, role) {
+    let has_access = match (min_role, &role) {
         (OrganizationRole::Admin, OrganizationRole::Admin) => true,
         (OrganizationRole::Member, OrganizationRole::Admin | OrganizationRole::Member) => true,
         (OrganizationRole::Viewer, _) => true,
@@ -208,7 +213,7 @@ pub async fn invite_member(
     State(state): State<AppState>,
     claims: AuthClaims,
     Path(id): Path<Uuid>,
-    Json(payload): Json<InviteMemberRequest>,
+    ValidatedJson(payload): ValidatedJson<InviteMemberRequest>,
 ) -> ApiResult<StatusCode> {
     // Check if user is an Admin of the org
     check_org_role(&state.db, id, &claims.sub, OrganizationRole::Admin).await?;
@@ -237,7 +242,7 @@ pub async fn invite_member(
     .bind(expires_at)
     .execute(&state.db)
     .await
-    .map_err(|e| db_internal_error("create_invitation", e))?;
+    .map_err::<crate::error::ApiError, _>(|e| db_internal_error("create_invitation", e))?;
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -305,7 +310,7 @@ pub async fn accept_invitation(
 
     tx.commit()
         .await
-        .map_err(|e| db_internal_error("commit_transaction", e))?;
+        .map_err::<crate::error::ApiError, _>(|e| db_internal_error("commit_transaction", e))?;
 
     Ok(StatusCode::OK)
 }

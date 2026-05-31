@@ -1,3 +1,4 @@
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -22,7 +23,7 @@ use crate::{
 pub async fn create_backup(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
-    Json(req): Json<CreateBackupRequest>,
+    ValidatedJson(req): ValidatedJson<CreateBackupRequest>,
 ) -> ApiResult<Json<ContractBackup>> {
     let contract: shared::Contract = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
         .bind(contract_id)
@@ -90,12 +91,12 @@ pub async fn list_backups(
 pub async fn restore_backup(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
-    Json(req): Json<RestoreBackupRequest>,
+    ValidatedJson(req): ValidatedJson<RestoreBackupRequest>,
 ) -> ApiResult<Json<BackupRestoration>> {
     let start = std::time::Instant::now();
 
     let backup_date = NaiveDate::parse_from_str(&req.backup_date, "%Y-%m-%d")
-        .map_err(|_| ApiError::bad_request("invalid_date", "Invalid date format"))?;
+        .map_err(|_| ApiError::bad_request_with("invalid_date", "Invalid date format"))?;
 
     let backup = sqlx::query_as::<_, ContractBackup>(
         "SELECT * FROM contract_backups WHERE contract_id = $1 AND backup_date = $2",
@@ -140,7 +141,7 @@ pub async fn verify_backup(
     Path((contract_id, backup_date)): Path<(Uuid, String)>,
 ) -> ApiResult<StatusCode> {
     let date = NaiveDate::parse_from_str(&backup_date, "%Y-%m-%d")
-        .map_err(|_| ApiError::bad_request("invalid_date", "Invalid date format"))?;
+        .map_err(|_| ApiError::bad_request_with("invalid_date", "Invalid date format"))?;
 
     sqlx::query(
         "UPDATE contract_backups SET verified = true WHERE contract_id = $1 AND backup_date = $2",
@@ -192,7 +193,7 @@ pub async fn get_backup_stats(
 pub async fn create_disaster_recovery_plan(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
-    Json(req): Json<CreateDisasterRecoveryPlanRequest>,
+    ValidatedJson(req): ValidatedJson<CreateDisasterRecoveryPlanRequest>,
 ) -> ApiResult<Json<DisasterRecoveryPlan>> {
     let drp = sqlx::query_as::<_, DisasterRecoveryPlan>(
         r#"
@@ -237,7 +238,7 @@ pub async fn get_disaster_recovery_plan(
 pub async fn execute_recovery(
     State(state): State<AppState>,
     Path(contract_id): Path<Uuid>,
-    Json(req): Json<ExecuteRecoveryRequest>,
+    ValidatedJson(req): ValidatedJson<ExecuteRecoveryRequest>,
 ) -> ApiResult<Json<RecoveryMetrics>> {
     let start_time = std::time::Instant::now();
 
@@ -256,7 +257,7 @@ pub async fn execute_recovery(
                 .ok_or_else(|| ApiError::not_found("backup", "No backups found for contract"))?
         } else {
             NaiveDate::parse_from_str(&target, "%Y-%m-%d")
-                .map_err(|_| ApiError::bad_request("invalid_date", "Invalid date format"))?
+                .map_err(|_| ApiError::bad_request_with("invalid_date", "Invalid date format"))?
         }
     } else {
         // Get the latest backup within RPO window
@@ -314,7 +315,7 @@ async fn restore_backup_from_date(
     let start = std::time::Instant::now();
 
     let backup_date = NaiveDate::parse_from_str(&req.backup_date, "%Y-%m-%d")
-        .map_err(|_| ApiError::bad_request("invalid_date", "Invalid date format"))?;
+        .map_err(|_| ApiError::bad_request_with("invalid_date", "Invalid date format"))?;
 
     let backup = sqlx::query_as::<_, ContractBackup>(
         "SELECT * FROM contract_backups WHERE contract_id = $1 AND backup_date = $2",

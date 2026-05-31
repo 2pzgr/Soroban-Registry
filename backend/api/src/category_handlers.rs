@@ -13,6 +13,7 @@
 //! `force=true` query parameter is supplied, in which case those contracts have
 //! their category field cleared before the category row is removed.
 
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -32,49 +33,42 @@ use crate::{
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateCategoryRequest {
-    /// Display name for the category (max 100 characters, must be unique).
     pub name: String,
-    /// Optional human-readable description shown on the frontend.
     pub description: Option<String>,
-    /// UUID of the parent category.  Supply to nest this category under another.
     pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCategoryRequest {
-    /// New display name.  Omit to leave unchanged.
     pub name: Option<String>,
-    /// New description.  Send an empty string to clear it.
     pub description: Option<String>,
-    /// New parent UUID.  Send `null` explicitly to make the category top-level.
     #[serde(default, deserialize_with = "deserialize_optional_uuid_string")]
     pub parent_id: Option<Option<String>>,
 }
 
-/// Query parameters for DELETE /api/admin/categories/:id
 #[derive(Debug, Deserialize)]
 pub struct DeleteCategoryQuery {
-    /// When `true`, contracts that reference this category have their category
-    /// field cleared before the category is deleted.  Defaults to `false`.
     #[serde(default)]
     pub force: bool,
 }
 
-/// Raw row returned by the list query (includes computed usage_count).
-#[derive(Debug, FromRow)]
-struct CategoryRow {
-    id: Uuid,
-    name: String,
-    slug: String,
-    description: Option<String>,
-    parent_id: Option<Uuid>,
-    is_default: bool,
-    usage_count: i64,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+// Raw row returned by the list query (includes computed usage_count, contract_count, new_24h, trending).
+#[derive(Debug, Clone, FromRow)]
+pub struct CategoryRow {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub description: Option<String>,
+    pub parent_id: Option<Uuid>,
+    pub is_default: bool,
+    pub usage_count: i64,
+    pub contract_count: i64,
+    pub new_24h: i64,
+    pub trending: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-/// Public-facing category representation returned by all endpoints.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CategoryResponse {
     pub id: String,
@@ -82,14 +76,13 @@ pub struct CategoryResponse {
     pub slug: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// UUID of the parent category, or `null` for top-level categories.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    /// Whether this category was seeded at database creation time and should
-    /// not be permanently removed.
     pub is_default: bool,
-    /// Number of contracts currently assigned to this category.
     pub usage_count: i64,
+    pub contract_count: i64,
+    pub new_24h: i64,
+    pub trending: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -104,6 +97,9 @@ impl From<CategoryRow> for CategoryResponse {
             parent_id: row.parent_id.map(|id| id.to_string()),
             is_default: row.is_default,
             usage_count: row.usage_count,
+            contract_count: row.contract_count,
+            new_24h: row.new_24h,
+            trending: row.trending,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -112,12 +108,6 @@ impl From<CategoryRow> for CategoryResponse {
 
 // ── Slug helper ───────────────────────────────────────────────────────────────
 
-/// Converts a category name into a URL-safe slug.
-///
-/// ```text
-/// "DeFi Lending" → "defi-lending"
-/// "DEX"          → "dex"
-/// ```
 fn to_slug(name: &str) -> String {
     name.trim()
         .to_lowercase()
@@ -132,9 +122,6 @@ fn to_slug(name: &str) -> String {
 
 // ── Serde helper for nullable optional UUID ───────────────────────────────────
 
-/// Deserialises `Option<Option<String>>` so the caller can distinguish between
-/// a field that was omitted (outer `None`) and one explicitly set to `null`
-/// (inner `None`).
 fn deserialize_optional_uuid_string<'de, D>(
     deserializer: D,
 ) -> Result<Option<Option<String>>, D::Error>
@@ -156,7 +143,10 @@ const LIST_QUERY: &str = r#"
         cc.is_default,
         cc.created_at,
         cc.updated_at,
-        COUNT(c.id) AS usage_count
+        COUNT(c.id) AS usage_count,
+        COUNT(c.id) AS contract_count,
+        COUNT(c.id) FILTER (WHERE c.created_at > NOW() - INTERVAL '24 hour') AS new_24h,
+        COUNT(c.id) FILTER (WHERE c.created_at > NOW() - INTERVAL '7 day') AS trending
     FROM contract_categories cc
     LEFT JOIN contracts c ON c.category = cc.name
     GROUP BY cc.id
@@ -170,7 +160,7 @@ fn db_err(op: &str, err: sqlx::Error) -> ApiError {
 
 fn parse_category_id(id: &str) -> ApiResult<Uuid> {
     Uuid::parse_str(id).map_err(|_| {
-        ApiError::bad_request(
+        ApiError::bad_request_with(
             "InvalidCategoryId",
             format!("Invalid category ID format: {}", id),
         )
@@ -182,7 +172,7 @@ fn parse_optional_parent_id(raw: &Option<String>) -> ApiResult<Option<Uuid>> {
         None => Ok(None),
         Some(s) if s.is_empty() => Ok(None),
         Some(s) => Uuid::parse_str(s).map(Some).map_err(|_| {
-            ApiError::bad_request(
+            ApiError::bad_request_with(
                 "InvalidParentId",
                 format!("Invalid parent category ID format: {}", s),
             )
@@ -192,30 +182,137 @@ fn parse_optional_parent_id(raw: &Option<String>) -> ApiResult<Option<Uuid>> {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// List all categories with their current usage counts.
-///
-/// Results are ordered so that default (seeded) categories appear first,
-/// followed by custom categories alphabetically.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct CategoriesResponse {
+    pub categories: Vec<CategoryResponse>,
+    pub recommendations: Vec<CategoryRecommendation>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct CategoryRecommendation {
+    pub name: String,
+    pub reason: String,
+}
+
 #[utoipa::path(
     get,
     path = "/api/categories",
     responses(
-        (status = 200, description = "List of contract categories with usage counts", body = [CategoryResponse])
+        (status = 200, description = "List of contract categories with usage counts", body = CategoriesResponse)
     ),
     tag = "Categories"
 )]
 pub async fn list_categories(
     State(state): State<AppState>,
-) -> ApiResult<Json<Vec<CategoryResponse>>> {
-    let rows: Vec<CategoryRow> = sqlx::query_as(LIST_QUERY)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|err| db_err("list categories", err))?;
+    Query(params): Query<CategoryQuery>,
+) -> ApiResult<Json<CategoriesResponse>> {
+    #[derive(Debug, Deserialize)]
+    struct CategoryQuery {
+        network: Option<String>,
+        sort_by: Option<String>,
+    }
 
-    Ok(Json(rows.into_iter().map(CategoryResponse::from).collect()))
-}
+    // Build cache key based on parameters
+    let cache_key = format!("categories:{:?}:{:?}", params.network, params.sort_by);
+    let (cached_opt, hit) = state.cache.get("category", &cache_key).await;
+    if hit {
+        if let Some(json_str) = cached_opt {
+            if let Ok(res) = serde_json::from_str::<CategoriesResponse>(&json_str) {
+                return Ok(Json(res));
+            }
+        }
+    }
 
-/// Get a single category by ID.
+    // Construct query with optional network filter
+    let query_str = if params.network.is_some() {
+        // network filter applied
+        r#"
+        SELECT
+            cc.id,
+            cc.name,
+            cc.slug,
+            cc.description,
+            cc.parent_id,
+            cc.is_default,
+            cc.created_at,
+            cc.updated_at,
+            COUNT(c.id) AS usage_count,
+            COUNT(c.id) AS contract_count,
+            COUNT(c.id) FILTER (WHERE c.created_at > NOW() - INTERVAL '24 hour') AS new_24h,
+            COUNT(c.id) FILTER (WHERE c.created_at > NOW() - INTERVAL '7 day') AS trending
+        FROM contract_categories cc
+        LEFT JOIN contracts c ON c.category = cc.name AND c.network = $1
+        GROUP BY cc.id
+        ORDER BY cc.is_default DESC, cc.name ASC
+        "#
+    } else {
+        // no network filter
+        LIST_QUERY
+    };
+
+    let rows: Vec<CategoryRow> = if let Some(net) = &params.network {
+        sqlx::query_as(query_str)
+            .bind(net)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_err("list categories", err))?
+    } else {
+        sqlx::query_as(query_str)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| db_err("list categories", err))?
+    };
+
+    let mut categories: Vec<CategoryResponse> = rows.into_iter().map(CategoryResponse::from).collect();
+
+        // Return categories with recommendations
+    #[derive(Debug, Serialize, utoipa::ToSchema)]
+    pub struct CategoriesResponse {
+        pub categories: Vec<CategoryResponse>,
+        pub recommendations: Vec<CategoryRecommendation>,
+    }
+
+    #[derive(Debug, Serialize, utoipa::ToSchema)]
+    pub struct CategoryRecommendation {
+        pub name: String,
+        pub reason: String,
+    }
+
+    if let Some(sort) = params.sort_by {
+        match sort.as_str() {
+            "name" => categories.sort_by(|a, b| a.name.cmp(&b.name)),
+            "count" => categories.sort_by(|a, b| b.contract_count.cmp(&a.contract_count)),
+            "trending" => categories.sort_by(|a, b| b.trending.cmp(&a.trending)),
+            _ => {}
+        }
+    }
+
+    // Cache the result for 6 hours
+    if let Ok(json) = serde_json::to_string(&categories) {
+        let _ = state.cache.put("category", &cache_key, json, Some(std::time::Duration::from_secs(21600))).await;
+    }
+
+    // Compute recommendations (top 3 trending)
+    let mut recommendations: Vec<CategoryRecommendation> = categories
+        .iter()
+        .sorted_by_key(|c| -c.trending)
+        .take(3)
+        .map(|c| CategoryRecommendation {
+            name: c.name.clone(),
+            reason: "Trending".to_string(),
+        })
+        .collect();
+
+    // Build response wrapper
+    let response = CategoriesResponse {
+        categories,
+        recommendations,
+    };
+
+    Ok(Json(response))
+    }
+
+
 #[utoipa::path(
     get,
     path = "/api/categories/{id}",
@@ -252,10 +349,6 @@ pub async fn get_category(
     Ok(Json(CategoryResponse::from(row)))
 }
 
-/// Create a new contract category.
-///
-/// The slug is derived automatically from the name.  Returns 409 Conflict if a
-/// category with the same name or slug already exists.
 #[utoipa::path(
     post,
     path = "/api/admin/categories",
@@ -270,7 +363,7 @@ pub async fn get_category(
 )]
 pub async fn create_category(
     State(state): State<AppState>,
-    Json(req): Json<CreateCategoryRequest>,
+    ValidatedJson(req): ValidatedJson<CreateCategoryRequest>,
 ) -> ApiResult<(StatusCode, Json<CategoryResponse>)> {
     let name = req.name.trim().to_string();
     if name.is_empty() || name.len() > 100 {
@@ -290,8 +383,6 @@ pub async fn create_category(
 
     let parent_uuid = parse_optional_parent_id(&req.parent_id)?;
 
-    // If a parent was supplied, verify it exists to give a clear error message
-    // rather than a cryptic FK violation.
     if let Some(pid) = parent_uuid {
         let parent_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_categories WHERE id = $1)")
@@ -336,10 +427,6 @@ pub async fn create_category(
     Ok((StatusCode::CREATED, Json(CategoryResponse::from(row))))
 }
 
-/// Update a category's name, description, or parent.
-///
-/// Only fields that are explicitly included in the JSON body are changed.
-/// Changing the name automatically regenerates the slug.
 #[utoipa::path(
     put,
     path = "/api/admin/categories/{id}",
@@ -359,11 +446,10 @@ pub async fn create_category(
 pub async fn update_category(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateCategoryRequest>,
+    ValidatedJson(req): ValidatedJson<UpdateCategoryRequest>,
 ) -> ApiResult<Json<CategoryResponse>> {
     let category_uuid = parse_category_id(&id)?;
 
-    // Confirm the category exists before attempting the update.
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_categories WHERE id = $1)")
             .bind(category_uuid)
@@ -378,12 +464,10 @@ pub async fn update_category(
         ));
     }
 
-    // Resolve the new parent UUID if one was supplied.
     let new_parent: Option<Option<Uuid>> = match &req.parent_id {
-        None => None, // field was omitted → do not change parent
+        None => None,
         Some(inner) => {
             let uuid = parse_optional_parent_id(inner)?;
-            // Guard against self-referencing loops.
             if let Some(pid) = uuid {
                 if pid == category_uuid {
                     return Err(ApiError::bad_request(
@@ -410,7 +494,6 @@ pub async fn update_category(
         }
     };
 
-    // Build the UPDATE statement dynamically so we only touch supplied fields.
     let updated: CategoryRow = {
         let name_val = req.name.as_deref().map(str::trim);
         if let Some(name) = name_val {
@@ -425,7 +508,6 @@ pub async fn update_category(
         let new_slug = name_val.map(to_slug);
 
         match new_parent {
-            // parent unchanged
             None => sqlx::query_as(
                 r#"
                 WITH updated AS (
@@ -461,7 +543,6 @@ pub async fn update_category(
                 _ => db_err("update category", err),
             })?,
 
-            // parent explicitly changed (possibly to NULL)
             Some(parent_uuid) => sqlx::query_as(
                 r#"
                 WITH updated AS (
@@ -504,15 +585,6 @@ pub async fn update_category(
     Ok(Json(CategoryResponse::from(updated)))
 }
 
-/// Delete a category.
-///
-/// Default categories (`is_default = true`) cannot be deleted.
-///
-/// If any contracts are currently assigned to this category:
-///   - Without `?force=true` the request fails with **409 Conflict** and
-///     includes the current usage count in the response body.
-///   - With `?force=true` those contracts have their `category` field cleared
-///     (`NULL`) before the category row is removed.
 #[utoipa::path(
     delete,
     path = "/api/admin/categories/{id}",
@@ -537,7 +609,6 @@ pub async fn delete_category(
 ) -> ApiResult<StatusCode> {
     let category_uuid = parse_category_id(&id)?;
 
-    // Fetch the category so we can check is_default and name in one query.
     let row = sqlx::query_as::<_, (String, bool)>(
         "SELECT name, is_default FROM contract_categories WHERE id = $1",
     )
@@ -561,7 +632,6 @@ pub async fn delete_category(
         ));
     }
 
-    // Count contracts currently using this category.
     let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE category = $1")
         .bind(&name)
         .fetch_one(&state.db)
@@ -579,7 +649,6 @@ pub async fn delete_category(
         ));
     }
 
-    // With force=true: clear the category field on affected contracts first.
     if usage_count > 0 && query.force {
         sqlx::query("UPDATE contracts SET category = NULL WHERE category = $1")
             .bind(&name)
@@ -596,8 +665,6 @@ pub async fn delete_category(
 
     Ok(StatusCode::NO_CONTENT)
 }
-
-// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -1,3 +1,4 @@
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -192,7 +193,7 @@ struct ProposalSigningState {
 
 pub async fn create_policy(
     State(state): State<AppState>,
-    Json(payload): Json<CreateMultisigPolicyRequest>,
+    ValidatedJson(payload): ValidatedJson<CreateMultisigPolicyRequest>,
 ) -> ApiResult<Json<MultisigPolicy>> {
     if payload.name.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -266,7 +267,7 @@ pub async fn create_policy(
 
 pub async fn create_deploy_proposal(
     State(state): State<AppState>,
-    Json(payload): Json<CreateDeployProposalRequest>,
+    ValidatedJson(payload): ValidatedJson<CreateDeployProposalRequest>,
 ) -> ApiResult<Json<DeployProposal>> {
     if payload.contract_name.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -394,10 +395,10 @@ pub async fn create_deploy_proposal(
 pub async fn sign_proposal(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<SignProposalRequest>,
+    ValidatedJson(payload): ValidatedJson<SignProposalRequest>,
 ) -> ApiResult<Json<SignProposalResponse>> {
     let proposal_id = Uuid::parse_str(&id).map_err(|_| {
-        ApiError::bad_request("InvalidProposalId", "proposal id must be a valid UUID")
+        ApiError::bad_request_with("InvalidProposalId", "proposal id must be a valid UUID")
     })?;
 
     if payload.signer_address.trim().is_empty() {
@@ -652,7 +653,7 @@ pub async fn execute_proposal(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ExecuteProposalResponse>> {
     let proposal_id = Uuid::parse_str(&id).map_err(|_| {
-        ApiError::bad_request("InvalidProposalId", "proposal id must be a valid UUID")
+        ApiError::bad_request_with("InvalidProposalId", "proposal id must be a valid UUID")
     })?;
 
     let mut tx = state.db.begin().await.map_err(|e| {
@@ -737,7 +738,7 @@ pub async fn proposal_info(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProposalInfoResponse>> {
     let proposal_id = Uuid::parse_str(&id).map_err(|_| {
-        ApiError::bad_request("InvalidProposalId", "proposal id must be a valid UUID")
+        ApiError::bad_request_with("InvalidProposalId", "proposal id must be a valid UUID")
     })?;
 
     let proposal = sqlx::query_as::<_, DeployProposal>(
@@ -897,8 +898,9 @@ pub async fn list_publisher_keys(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<PublisherMultisigKey>>> {
-    let publisher_id = Uuid::parse_str(&id)
-        .map_err(|_| ApiError::bad_request("InvalidPublisherId", "publisher id must be a UUID"))?;
+    let publisher_id = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request_with("InvalidPublisherId", "publisher id must be a UUID")
+    })?;
 
     let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM publishers WHERE id = $1")
         .bind(publisher_id)
@@ -938,10 +940,11 @@ pub async fn list_publisher_keys(
 pub async fn create_publisher_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(payload): Json<CreatePublisherKeyRequest>,
+    ValidatedJson(payload): ValidatedJson<CreatePublisherKeyRequest>,
 ) -> ApiResult<Json<PublisherMultisigKey>> {
-    let publisher_id = Uuid::parse_str(&id)
-        .map_err(|_| ApiError::bad_request("InvalidPublisherId", "publisher id must be a UUID"))?;
+    let publisher_id = Uuid::parse_str(&id).map_err(|_| {
+        ApiError::bad_request_with("InvalidPublisherId", "publisher id must be a UUID")
+    })?;
 
     if payload.key_name.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -997,7 +1000,7 @@ pub async fn deactivate_publisher_key(
     Path(id): Path<String>,
 ) -> ApiResult<Json<PublisherMultisigKey>> {
     let key_id = Uuid::parse_str(&id)
-        .map_err(|_| ApiError::bad_request("InvalidKeyId", "key id must be a UUID"))?;
+        .map_err(|_| ApiError::bad_request_with("InvalidKeyId", "key id must be a UUID"))?;
 
     let row = sqlx::query_as::<_, PublisherMultisigKey>(
         "UPDATE publisher_multisig_keys

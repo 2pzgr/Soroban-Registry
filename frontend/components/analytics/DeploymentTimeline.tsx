@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { api, Contract, Network } from '@/lib/api';
+import type { Contract, Network } from '@/types';
+import { api } from '@/lib/api';
 import { 
   Calendar, 
   Info, 
@@ -88,8 +89,9 @@ export default function DeploymentTimeline({ initialData = [] }: DeploymentTimel
   }, [contracts]);
 
   const timeBounds = useMemo(() => {
-    if (filteredContracts.length === 0) return { min: 0, max: Date.now() };
+    if (filteredContracts.length === 0) return { min: 0, max: 0 };
     const timestamps = filteredContracts.map(c => new Date(c.created_at).getTime());
+    if (filteredContracts.length === 0) return { min: 0, max: Date.now() };
     return {
       min: Math.min(...timestamps),
       max: Math.max(...timestamps)

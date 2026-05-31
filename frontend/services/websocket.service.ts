@@ -23,11 +23,16 @@ export class WebSocketService {
   }
 
   private getWebSocketUrl(): string {
-    const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-    return baseUrl.replace(/^http/, 'ws').replace(/\/$/, '');
+    const baseUrl = process.env.NEXT_PUBLIC_API_URL || "";
+    return baseUrl.replace(/^http/, "ws").replace(/\/$/, "");
   }
 
   connect(): Promise<void> {
+    // Guard: WebSocket is not available in SSR / Node.js environments
+    if (typeof window === "undefined" || typeof WebSocket === "undefined") {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve, reject) => {
       try {
         this.ws = new WebSocket(`${this.url}/ws/contracts`);
@@ -35,7 +40,7 @@ export class WebSocketService {
         this.ws.onopen = () => {
           this.reconnectAttempts = 0;
           this.startPing();
-          this.openHandlers.forEach(handler => handler());
+          this.openHandlers.forEach((handler) => handler());
           resolve();
         };
 
@@ -43,16 +48,19 @@ export class WebSocketService {
           try {
             const message = JSON.parse(event.data) as WebSocketMessage;
             const handlers = this.messageHandlers.get(message.type);
-            handlers?.forEach(handler => handler(message.data));
+            handlers?.forEach((handler) => handler(message.data));
           } catch (err) {
-            console.error('Failed to parse WebSocket message:', err);
+            console.error("Failed to parse WebSocket message:", err);
           }
         };
 
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         this.ws.onerror = (_event) => {
-          const error = new Error('WebSocket connection failed');
-          this.errorHandlers.forEach(handler => handler(error));
+          const error = new Error("WebSocket connection failed");
+          this.errorHandlers.forEach((handler) => handler(error));
+          // Warn instead of hard-rejecting so callers that don't await
+          // connect() don't generate uncaught promise rejections.
+          console.warn("[WebSocketService]", error.message);
           reject(error);
         };
 
@@ -69,7 +77,10 @@ export class WebSocketService {
   private reconnect(): void {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1), 30000);
+      const delay = Math.min(
+        this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+        30000,
+      );
       setTimeout(() => {
         this.connect().catch(console.error);
       }, delay);
@@ -79,7 +90,7 @@ export class WebSocketService {
   private startPing(): void {
     this.pingInterval = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'ping', data: {} });
+        this.send({ type: "ping", data: {} });
       }
     }, 30000); // Ping every 30 seconds
   }
@@ -135,4 +146,6 @@ export class WebSocketService {
   }
 }
 
-export const wsService = new WebSocketService();
+// Only instantiate on the client side to avoid SSR errors
+export const wsService =
+  typeof window !== "undefined" ? new WebSocketService() : (null as unknown as WebSocketService);

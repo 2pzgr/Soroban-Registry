@@ -1,6 +1,7 @@
 // Favorites Handlers — GET/PATCH /api/me/preferences (favorites field)
 // Allows authenticated publishers to read and update their favorites list.
 
+use crate::validation::extractors::ValidatedJson;
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -32,13 +33,12 @@ pub async fn get_favorites(
 ) -> ApiResult<Json<UserFavoritesPreferences>> {
     let publisher_id = auth_user.publisher_id;
 
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT favorites FROM user_preferences WHERE publisher_id = $1",
-    )
-    .bind(publisher_id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
+    let row: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT favorites FROM user_preferences WHERE publisher_id = $1")
+            .bind(publisher_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| ApiError::internal(format!("Database error: {}", e)))?;
 
     let favorites = match row {
         Some((val,)) => parse_favorites_json(val),
@@ -54,7 +54,7 @@ pub async fn get_favorites(
 pub async fn update_favorites(
     State(state): State<AppState>,
     auth_user: auth::AuthenticatedUser,
-    Json(req): Json<UpdateFavoritesRequest>,
+    ValidatedJson(req): ValidatedJson<UpdateFavoritesRequest>,
 ) -> ApiResult<Json<UserFavoritesPreferences>> {
     let publisher_id = auth_user.publisher_id;
 

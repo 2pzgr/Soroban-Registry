@@ -42,7 +42,7 @@
 //! store (e.g. via the `upstash-redis` crate or `fred`).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
@@ -62,21 +62,22 @@ use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 
-// Read limits — 1,000 requests per hour per client (issue #609).
+// Issue #891: 1,000 requests per minute per IP/API key by default.
 const DEFAULT_ANON_LIMIT: u32 = 1_000;
 const DEFAULT_AUTH_LIMIT: u32 = 1_000;
-
-// Write limits — tighter quota for mutation endpoints.
-const DEFAULT_WRITE_ANON_LIMIT: u32 = 100;
-const DEFAULT_WRITE_AUTH_LIMIT: u32 = 300;
-
-const DEFAULT_WINDOW_SECONDS: u64 = 3_600; // 1 hour
+const DEFAULT_WINDOW_SECONDS: u64 = 60;
 #[allow(dead_code)]
 const DEFAULT_CONTRACTS_PAGE_SIZE: u32 = 50;
 #[allow(dead_code)]
 const MAX_CONTRACTS_PAGE_SIZE: u32 = 1000;
+const ABI_ENDPOINT_LIMIT_PER_MINUTE: u32 = 1_000;
 #[allow(dead_code)]
 const ENDPOINT_LIMIT_ENV_PREFIX: &str = "RATE_LIMIT_ENDPOINT_";
+
+/// Issue #727 — tiered limits over the configured window.
+const FREE_TIER_LIMIT: u32 = 1_000;
+const PRO_TIER_LIMIT: u32 = 10_000;
+const BURST_WINDOW_SECONDS: u64 = 60; // 1 minute burst window
 
 /// How often the background task sweeps for expired buckets.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(5 * 60); // every 5 minutes
@@ -84,6 +85,34 @@ const EVICTION_INTERVAL: Duration = Duration::from_secs(5 * 60); // every 5 minu
 const HEADER_RATE_LIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const HEADER_RATE_LIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
 const HEADER_RATE_LIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
+const HEADER_RATE_LIMIT_TIER: HeaderName = HeaderName::from_static("x-ratelimit-tier");
+
+/// API tier that determines quota limits (issue #727).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiTier {
+    Free,
+    Pro,
+    /// Enterprise limit is read from ENTERPRISE_RATE_LIMIT_PER_HOUR at startup.
+    Enterprise,
+}
+
+impl ApiTier {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ApiTier::Free => "free",
+            ApiTier::Pro => "pro",
+            ApiTier::Enterprise => "enterprise",
+        }
+    }
+
+    pub fn from_header(value: &str) -> Self {
+        match value.to_lowercase().as_str() {
+            "pro" => ApiTier::Pro,
+            "enterprise" => ApiTier::Enterprise,
+            _ => ApiTier::Free,
+        }
+    }
+}
 
 /// Paths that bypass rate limiting entirely.
 ///
@@ -101,6 +130,18 @@ pub struct RateLimitState {
     config: std::sync::Arc<RateLimitConfig>,
     /// Shared bucket map — protected by a *tokio* Mutex so it is async-safe.
     buckets: std::sync::Arc<Mutex<HashMap<BucketKey, BucketState>>>,
+}
+
+/// Snapshot of quota usage for a client key (used by the /api/quota endpoint).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuotaSnapshot {
+    pub tier: String,
+    pub hourly_limit: u32,
+    pub hourly_used: usize,
+    pub hourly_remaining: usize,
+    pub burst_limit: u32,
+    pub burst_used: usize,
+    pub burst_remaining: usize,
 }
 
 impl RateLimitState {
@@ -138,13 +179,22 @@ impl RateLimitState {
 
                 // Retain only buckets that have seen traffic recently.
                 map.retain(|_, state| {
-                    state
+                    // Check both windows; keep if either has a recent timestamp.
+                    let hourly_active = state
                         .timestamps
                         .back()
                         .map(|last_seen| {
                             now.saturating_duration_since(*last_seen) < window.saturating_mul(2)
                         })
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                    let burst_active = state
+                        .burst_timestamps
+                        .back()
+                        .map(|last_seen| {
+                            now.saturating_duration_since(*last_seen) < window.saturating_mul(2)
+                        })
+                        .unwrap_or(false);
+                    hourly_active || burst_active
                 });
 
                 let evicted = before - map.len();
@@ -159,7 +209,12 @@ impl RateLimitState {
         });
     }
 
-    async fn check_request(&self, key: BucketKey, limit: u32) -> RateLimitDecision {
+    async fn check_request(
+        &self,
+        key: BucketKey,
+        hourly_limit: u32,
+        burst_limit: u32,
+    ) -> RateLimitDecision {
         let now = Instant::now();
 
         // tokio::sync::Mutex::lock() never poisons — no .expect() needed.
@@ -167,8 +222,10 @@ impl RateLimitState {
 
         let bucket = buckets.entry(key).or_insert_with(|| BucketState {
             timestamps: VecDeque::new(),
+            burst_timestamps: VecDeque::new(),
         });
 
+        // Trim the hourly sliding window
         let window_start_cutoff = now.checked_sub(self.config.window).unwrap_or(now);
         while bucket
             .timestamps
@@ -180,6 +237,18 @@ impl RateLimitState {
             bucket.timestamps.pop_front();
         }
 
+        // Trim the burst (1-minute) sliding window
+        let burst_cutoff = now.checked_sub(self.config.burst_window).unwrap_or(now);
+        while bucket
+            .burst_timestamps
+            .front()
+            .copied()
+            .map(|ts| ts <= burst_cutoff)
+            .unwrap_or(false)
+        {
+            bucket.burst_timestamps.pop_front();
+        }
+
         let reset_seconds = bucket
             .timestamps
             .front()
@@ -187,41 +256,117 @@ impl RateLimitState {
             .map(|expiry| ceil_duration_to_seconds(expiry.saturating_duration_since(now)).max(1))
             .unwrap_or_else(|| ceil_duration_to_seconds(self.config.window).max(1));
 
-        if (bucket.timestamps.len() as u32) >= limit {
+        // Reject if hourly limit exceeded
+        if (bucket.timestamps.len() as u32) >= hourly_limit {
             return RateLimitDecision {
                 allowed: false,
-                limit,
+                limit: hourly_limit,
                 remaining: 0,
                 reset_seconds,
             };
         }
 
+        // Reject if burst limit exceeded (too many in the last minute)
+        if (bucket.burst_timestamps.len() as u32) >= burst_limit {
+            return RateLimitDecision {
+                allowed: false,
+                limit: hourly_limit,
+                remaining: hourly_limit.saturating_sub(bucket.timestamps.len() as u32),
+                reset_seconds: ceil_duration_to_seconds(self.config.burst_window).max(1),
+            };
+        }
+
         bucket.timestamps.push_back(now);
-        let remaining = limit.saturating_sub(bucket.timestamps.len() as u32);
+        bucket.burst_timestamps.push_back(now);
+        let remaining = hourly_limit.saturating_sub(bucket.timestamps.len() as u32);
 
         RateLimitDecision {
             allowed: true,
-            limit,
+            limit: hourly_limit,
             remaining,
             reset_seconds,
         }
     }
 
-    fn select_limit_and_key<B>(&self, request: &Request<B>) -> (u32, BucketKey) {
-        let method = request.method();
+    /// Returns the current quota snapshot for a client key without consuming a token.
+    pub async fn quota_snapshot(&self, client_key: &str, tier: &ApiTier) -> QuotaSnapshot {
+        let now = Instant::now();
+        let hourly_limit = self.config.hourly_limit_for_tier(tier);
+        let burst_limit = self.config.burst_limit_for_tier(tier);
+
+        let buckets = self.buckets.lock().await;
+        let key = BucketKey {
+            client_key: client_key.to_owned(),
+        };
+
+        if let Some(bucket) = buckets.get(&key) {
+            let window_cutoff = now.checked_sub(self.config.window).unwrap_or(now);
+            let hourly_used = bucket
+                .timestamps
+                .iter()
+                .filter(|&&ts| ts > window_cutoff)
+                .count();
+
+            let burst_cutoff = now.checked_sub(self.config.burst_window).unwrap_or(now);
+            let burst_used = bucket
+                .burst_timestamps
+                .iter()
+                .filter(|&&ts| ts > burst_cutoff)
+                .count();
+
+            QuotaSnapshot {
+                tier: tier.as_str().to_owned(),
+                hourly_limit,
+                hourly_used,
+                hourly_remaining: (hourly_limit as usize).saturating_sub(hourly_used),
+                burst_limit,
+                burst_used,
+                burst_remaining: (burst_limit as usize).saturating_sub(burst_used),
+            }
+        } else {
+            QuotaSnapshot {
+                tier: tier.as_str().to_owned(),
+                hourly_limit,
+                hourly_used: 0,
+                hourly_remaining: hourly_limit as usize,
+                burst_limit,
+                burst_used: 0,
+                burst_remaining: burst_limit as usize,
+            }
+        }
+    }
+
+    /// Derive the bucket key and API tier from an incoming request.
+    ///
+    /// Tier is resolved in order:
+    /// 1. `X-Api-Plan: free | pro | enterprise` header
+    /// 2. Defaults to `free` for unauthenticated requests, `free` for authenticated
+    ///    (upgrade to pro/enterprise requires the header or a future DB lookup).
+    fn select_limit_and_key<B>(&self, request: &Request<B>) -> (u32, u32, BucketKey, ApiTier) {
+        let tier = extract_api_tier(request);
         let path = request.uri().path();
         let query = request.uri().query();
-        let is_write = is_write_method(method);
+
+        if is_contract_abi_endpoint(request.method(), path) {
+            return (
+                ABI_ENDPOINT_LIMIT_PER_MINUTE * 60,
+                ABI_ENDPOINT_LIMIT_PER_MINUTE,
+                BucketKey {
+                    client_key: format!("abi:{}:{}", path, extract_client_ip(request)),
+                },
+                tier,
+            );
+        }
 
         if let Some(token) = extract_auth_token(request) {
-            let limit = if is_write {
-                self.config.write_auth_limit
-            } else {
-                self.config.auth_limit
-            };
-            let bucket_suffix = if is_write { "write" } else { "read" };
+            let hourly = self
+                .config
+                .per_api_key_limit(&token)
+                .unwrap_or_else(|| self.config.hourly_limit_for_tier(&tier));
+            let burst = self.config.burst_limit_for_limit(hourly);
             return (
-                limit,
+                hourly,
+                burst,
                 BucketKey {
                     client_key: format!("auth:{bucket_suffix}:{token}"),
                 },
@@ -235,23 +380,27 @@ impl RateLimitState {
                 BucketKey {
                     client_key: format!("anon:write:{ip}"),
                 },
+                tier,
             );
         }
 
-        let base_limit = self.config.anonymous_limit;
-        let limit = if let Some(page_size) =
-            contracts_page_size_rate_limit(method, path, query)
+        let hourly_base = self.config.anonymous_limit;
+        let hourly = if let Some(page_size) =
+            contracts_page_size_rate_limit(request.method(), path, query)
         {
-            scale_limit_by_page_size(base_limit, page_size)
+            scale_limit_by_page_size(hourly_base, page_size)
         } else {
-            base_limit
+            hourly_base
         };
+        let burst = self.config.burst_limit_for_limit(hourly);
 
         (
-            limit,
+            hourly,
+            burst,
             BucketKey {
                 client_key: format!("anon:read:{ip}"),
             },
+            tier,
         )
     }
 }
@@ -262,18 +411,23 @@ struct RateLimitConfig {
     write_anonymous_limit: u32,
     write_auth_limit: u32,
     window: Duration,
+    enterprise_limit: u32,
+    burst_window: Duration,
+    per_api_key_limits: HashMap<String, u32>,
+    trusted_client_ips: HashSet<String>,
+    trusted_api_keys: HashSet<String>,
 }
 
 impl RateLimitConfig {
     fn from_env() -> Self {
-        // Read limits — configurable per-IP; defaults to 1000 req/hour (issue #609).
+        // Issue #891: configurable per-IP and per-API-key limits; defaults to 1000 req/min.
         let anonymous_limit = env_u32_with_fallback(
-            "RATE_LIMIT_ANON_PER_HOUR",
+            "RATE_LIMIT_IP_PER_MINUTE",
             "RATE_LIMIT_ANON_PER_MINUTE",
             DEFAULT_ANON_LIMIT,
         );
         let auth_limit = env_u32_with_fallback(
-            "RATE_LIMIT_AUTH_PER_HOUR",
+            "RATE_LIMIT_API_KEY_PER_MINUTE",
             "RATE_LIMIT_AUTH_PER_MINUTE",
             DEFAULT_AUTH_LIMIT,
         );
@@ -287,6 +441,11 @@ impl RateLimitConfig {
             DEFAULT_WRITE_AUTH_LIMIT,
         );
         let window_seconds = env_u64("RATE_LIMIT_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS).max(1);
+        // Issue #727: enterprise tier custom limit
+        let enterprise_limit = env_u32("ENTERPRISE_RATE_LIMIT_PER_WINDOW", 100_000);
+        let per_api_key_limits = parse_key_limit_map("RATE_LIMIT_API_KEY_LIMITS");
+        let trusted_client_ips = parse_csv_set("RATE_LIMIT_TRUSTED_IPS");
+        let trusted_api_keys = parse_csv_set("RATE_LIMIT_TRUSTED_API_KEYS");
 
         tracing::info!(
             anonymous_limit,
@@ -294,7 +453,8 @@ impl RateLimitConfig {
             write_anonymous_limit,
             write_auth_limit,
             window_seconds,
-            "Rate limiter configured"
+            enterprise_limit,
+            "Rate limiter configured (issue #891/#727: per-IP/API-key quotas)"
         );
 
         Self {
@@ -303,6 +463,11 @@ impl RateLimitConfig {
             write_anonymous_limit,
             write_auth_limit,
             window: Duration::from_secs(window_seconds),
+            enterprise_limit,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits,
+            trusted_client_ips,
+            trusted_api_keys,
         }
     }
 
@@ -331,7 +496,60 @@ impl RateLimitConfig {
             write_anonymous_limit,
             write_auth_limit,
             window,
+            enterprise_limit: 100_000,
+            burst_window: Duration::from_secs(BURST_WINDOW_SECONDS),
+            per_api_key_limits: HashMap::new(),
+            trusted_client_ips: HashSet::new(),
+            trusted_api_keys: HashSet::new(),
         }
+    }
+
+    /// Returns the hourly limit for the given tier.
+    fn hourly_limit_for_tier(&self, tier: &ApiTier) -> u32 {
+        match tier {
+            ApiTier::Free => self.auth_limit.max(FREE_TIER_LIMIT),
+            ApiTier::Pro => self.auth_limit.max(PRO_TIER_LIMIT),
+            ApiTier::Enterprise => self.enterprise_limit,
+        }
+    }
+
+    /// Burst limit = ceil(hourly_limit × 1.2 / 60) requests per minute.
+    fn burst_limit_for_tier(&self, tier: &ApiTier) -> u32 {
+        let hourly = self.hourly_limit_for_tier(tier);
+        self.burst_limit_for_limit(hourly)
+    }
+
+    fn burst_limit_for_limit(&self, hourly: u32) -> u32 {
+        // 120 % of the per-minute equivalent; minimum 1
+        ((hourly as f64 * 1.2 / 60.0).ceil() as u32).max(1)
+    }
+
+    fn per_api_key_limit(&self, token: &str) -> Option<u32> {
+        let normalized = token
+            .strip_prefix("Bearer ")
+            .or_else(|| token.strip_prefix("ApiKey "))
+            .unwrap_or(token)
+            .trim();
+        self.per_api_key_limits.get(normalized).copied()
+    }
+
+    fn is_whitelisted<B>(&self, request: &Request<B>) -> bool {
+        let client_ip = extract_client_ip(request);
+        if self.trusted_client_ips.contains(&client_ip) {
+            return true;
+        }
+
+        extract_auth_token(request)
+            .map(|token| {
+                let normalized = token
+                    .strip_prefix("Bearer ")
+                    .or_else(|| token.strip_prefix("ApiKey "))
+                    .unwrap_or(&token)
+                    .trim()
+                    .to_string();
+                self.trusted_api_keys.contains(&normalized)
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -342,6 +560,8 @@ struct BucketKey {
 
 struct BucketState {
     timestamps: VecDeque<Instant>,
+    /// Timestamps in the 1-minute burst window (subset of `timestamps`).
+    burst_timestamps: VecDeque<Instant>,
 }
 
 struct RateLimitDecision {
@@ -356,14 +576,15 @@ pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Health probes, metrics scrapes, and admin paths bypass rate limiting.
-    if is_exempt_path(request.uri().path()) {
+    if rate_limiter.config.is_whitelisted(&request) {
         return next.run(request).await;
     }
 
     // Extract request metadata before awaiting to avoid borrowing `request` across `.await`.
-    let (limit, key) = rate_limiter.select_limit_and_key(&request);
-    let decision = rate_limiter.check_request(key, limit).await;
+    let (hourly_limit, burst_limit, key, tier) = rate_limiter.select_limit_and_key(&request);
+    let decision = rate_limiter
+        .check_request(key, hourly_limit, burst_limit)
+        .await;
 
     if !decision.allowed {
         let is_write = is_write_method(request.method());
@@ -379,6 +600,7 @@ pub async fn rate_limit_middleware(
             }))
             .into_response();
         attach_rate_limit_headers(&mut response, &decision);
+        attach_tier_header(&mut response, &tier);
         response.headers_mut().insert(
             RETRY_AFTER,
             HeaderValue::from_str(&decision.reset_seconds.to_string())
@@ -389,7 +611,14 @@ pub async fn rate_limit_middleware(
 
     let mut response = next.run(request).await;
     attach_rate_limit_headers(&mut response, &decision);
+    attach_tier_header(&mut response, &tier);
     response
+}
+
+fn attach_tier_header(response: &mut Response, tier: &ApiTier) {
+    if let Ok(val) = HeaderValue::from_str(tier.as_str()) {
+        response.headers_mut().insert(HEADER_RATE_LIMIT_TIER, val);
+    }
 }
 
 fn attach_rate_limit_headers(response: &mut Response, decision: &RateLimitDecision) {
@@ -441,7 +670,28 @@ fn extract_client_ip<B>(request: &Request<B>) -> String {
     "unknown".to_string()
 }
 
+/// Resolve API tier from the `X-Api-Plan` request header.
+/// Falls back to `Free` when the header is absent or unrecognised.
+fn extract_api_tier<B>(request: &Request<B>) -> ApiTier {
+    request
+        .headers()
+        .get("x-api-plan")
+        .and_then(|v| v.to_str().ok())
+        .map(ApiTier::from_header)
+        .unwrap_or(ApiTier::Free)
+}
+
 fn extract_auth_token<B>(request: &Request<B>) -> Option<String> {
+    if let Some(api_key) = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(api_key.to_string());
+    }
+
     request
         .headers()
         .get(AUTHORIZATION)
@@ -449,6 +699,29 @@ fn extract_auth_token<B>(request: &Request<B>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_key_limit_map(key: &str) -> HashMap<String, u32> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| {
+            let (api_key, limit) = entry.split_once('=')?;
+            let limit = limit.trim().parse::<u32>().ok()?;
+            (limit > 0).then(|| (api_key.trim().to_string(), limit))
+        })
+        .filter(|(api_key, _)| !api_key.is_empty())
+        .collect()
+}
+
+fn parse_csv_set(key: &str) -> HashSet<String> {
+    std::env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn parse_x_forwarded_for(raw: &str) -> Option<IpAddr> {
@@ -474,6 +747,10 @@ fn contracts_page_size_rate_limit(method: &Method, path: &str, query: Option<&st
     }
 
     Some(extract_page_size(query).unwrap_or(DEFAULT_CONTRACTS_PAGE_SIZE))
+}
+
+fn is_contract_abi_endpoint(method: &Method, path: &str) -> bool {
+    *method == Method::GET && path.starts_with("/api/v1/contracts/") && path.ends_with("/abi")
 }
 
 fn extract_page_size(query: Option<&str>) -> Option<u32> {
@@ -889,8 +1166,8 @@ mod tests {
             .header("x-forwarded-for", "10.0.0.1")
             .body(Body::empty())
             .unwrap();
-        let (limit, key) = state.select_limit_and_key(&req);
-        state.check_request(key, limit).await;
+        let (hourly, burst, key, _tier) = state.select_limit_and_key(&req);
+        state.check_request(key, hourly, burst).await;
 
         // Confirm one bucket exists
         assert_eq!(state.buckets.lock().await.len(), 1);
@@ -903,12 +1180,21 @@ mod tests {
             let now = Instant::now();
             let mut map = state.buckets.lock().await;
             map.retain(|_, s| {
-                s.timestamps
+                let hourly = s
+                    .timestamps
                     .back()
                     .map(|last_seen| {
                         now.saturating_duration_since(*last_seen) < window.saturating_mul(2)
                     })
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                let burst = s
+                    .burst_timestamps
+                    .back()
+                    .map(|last_seen| {
+                        now.saturating_duration_since(*last_seen) < window.saturating_mul(2)
+                    })
+                    .unwrap_or(false);
+                hourly || burst
             });
         }
 

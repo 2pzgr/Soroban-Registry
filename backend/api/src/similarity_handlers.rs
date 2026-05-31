@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::validation::extractors::ValidatedJson;
 use axum::{
     extract::{Json, Path, Query, State},
     response::IntoResponse,
@@ -121,7 +122,7 @@ pub async fn get_similar_contracts(
 )]
 pub async fn analyze_contract_similarity_batch(
     State(state): State<AppState>,
-    Json(req): Json<BatchSimilarityAnalysisRequest>,
+    ValidatedJson(req): ValidatedJson<BatchSimilarityAnalysisRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let limit = req.limit_per_contract.unwrap_or(10).clamp(1, 50);
 
@@ -610,7 +611,7 @@ fn round4(value: f64) -> f64 {
 
 fn parse_uuid(id: &str, label: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(id).map_err(|_| {
-        ApiError::bad_request("InvalidId", format!("Invalid {} ID format: {}", label, id))
+        ApiError::bad_request_with("InvalidId", format!("Invalid {} ID format: {}", label, id))
     })
 }
 
